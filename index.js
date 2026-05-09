@@ -316,4 +316,4 @@ app.listen(process.env.PORT || 3000, () => {
   console.log(`   Registro:  http://localhost:3000/registro`);
   console.log(`   Panel:     http://localhost:3000/panel`);
   console.log(`   QR:        http://localhost:3000/qr`);
-});Ya lo salvé
+})
