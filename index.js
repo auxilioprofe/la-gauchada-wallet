@@ -3,7 +3,6 @@ const express = require('express');
 const { GoogleAuth } = require('google-auth-library');
 const jwt = require('jsonwebtoken');
 const QRCode = require('qrcode');
-const fs = require('fs');
 const path = require('path');
 
 const app = express();
@@ -17,15 +16,17 @@ const CLASS_ID = process.env.CLASS_ID;
 // Base de datos simple en memoria (después migraremos a Firebase)
 let clientes = {};
 
+// Parsear credenciales desde variable de entorno
+const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+
 // Autenticación con Google
 const auth = new GoogleAuth({
-  keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+  credentials,
   scopes: ['https://www.googleapis.com/auth/wallet_object.issuer'],
 });
 
 // ── Generar link de Google Wallet ──────────────────────────
 async function generarWalletLink(cliente) {
-  const credentials = JSON.parse(fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS));
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
 
   // Crear objeto en Google Wallet
@@ -315,4 +316,4 @@ app.listen(process.env.PORT || 3000, () => {
   console.log(`   Registro:  http://localhost:3000/registro`);
   console.log(`   Panel:     http://localhost:3000/panel`);
   console.log(`   QR:        http://localhost:3000/qr`);
-});
+});Ya lo salvé
