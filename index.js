@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const QRCode = require('qrcode');
 const { createClient } = require('@libsql/client');
 const cookieSession = require('cookie-session');
- 
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -15,21 +15,21 @@ app.use(cookieSession({
   keys: [process.env.SESSION_SECRET || 'gauchada-secret'],
   maxAge: 8 * 60 * 60 * 1000,
 }));
- 
+
 function requireAuth(req, res, next) {
   if (req.session.autenticado) return next();
   res.redirect('/login');
 }
- 
+
 const ISSUER_ID = process.env.ISSUER_ID;
 const CLASS_ID = process.env.CLASS_ID;
- 
+
 // ── Base de datos Turso ────────────────────────────────────
 const db = createClient({
   url: process.env.TURSO_URL,
   authToken: process.env.TURSO_TOKEN,
 });
- 
+
 async function inicializarDB() {
   await db.execute(`
     CREATE TABLE IF NOT EXISTS clientes (
@@ -41,7 +41,7 @@ async function inicializarDB() {
     )
   `);
 }
- 
+
 async function obtenerCliente(id) {
   const result = await db.execute({
     sql: 'SELECT * FROM clientes WHERE id = ?',
@@ -49,38 +49,38 @@ async function obtenerCliente(id) {
   });
   return result.rows[0] || null;
 }
- 
+
 async function crearCliente(cliente) {
   await db.execute({
     sql: 'INSERT INTO clientes (id, nombre, telefono, sellos) VALUES (?, ?, ?, ?)',
     args: [cliente.id, cliente.nombre, cliente.telefono, cliente.sellos],
   });
 }
- 
+
 async function actualizarSellosDB(id, sellos) {
   await db.execute({
     sql: 'UPDATE clientes SET sellos = ? WHERE id = ?',
     args: [sellos, id],
   });
 }
- 
+
 async function obtenerTodosLosClientes() {
   const result = await db.execute('SELECT * FROM clientes ORDER BY creado_en DESC');
   return result.rows;
 }
- 
+
 // ── Credenciales Google ────────────────────────────────────
 const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
- 
+
 const auth = new GoogleAuth({
   credentials,
   scopes: ['https://www.googleapis.com/auth/wallet_object.issuer'],
 });
- 
+
 // ── Generar link de Google Wallet ──────────────────────────
 async function generarWalletLink(cliente) {
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
- 
+
   const client = await auth.getClient();
   const loyaltyObject = {
     id: objectId,
@@ -107,7 +107,7 @@ async function generarWalletLink(cliente) {
       alternateText: `#${cliente.id}`,
     },
   };
- 
+
   try {
     await client.request({
       url: `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject`,
@@ -117,7 +117,7 @@ async function generarWalletLink(cliente) {
   } catch (err) {
     if (err.response?.status !== 409) throw err;
   }
- 
+
   const claims = {
     iss: credentials.client_email,
     aud: 'google',
@@ -127,16 +127,16 @@ async function generarWalletLink(cliente) {
       loyaltyObjects: [{ id: objectId }],
     },
   };
- 
+
   const token = jwt.sign(claims, credentials.private_key, { algorithm: 'RS256' });
   return `https://pay.google.com/gp/v/save/${token}`;
 }
- 
+
 // ── Actualizar sellos en Google Wallet ─────────────────────
 async function actualizarSellosWallet(cliente) {
   const client = await auth.getClient();
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
- 
+
   await client.request({
     url: `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(objectId)}`,
     method: 'PATCH',
@@ -157,9 +157,9 @@ async function actualizarSellosWallet(cliente) {
     },
   });
 }
- 
+
 // ── RUTAS ──────────────────────────────────────────────────
- 
+
 app.get('/login', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -194,7 +194,7 @@ app.get('/login', (req, res) => {
     </html>
   `);
 });
- 
+
 app.post('/login', (req, res) => {
   const { password } = req.body;
   if (password === process.env.PANEL_PASSWORD) {
@@ -204,12 +204,12 @@ app.post('/login', (req, res) => {
     res.redirect('/login?error=1');
   }
 });
- 
+
 app.get('/logout', (req, res) => {
   req.session = null;
   res.redirect('/login');
 });
- 
+
 app.get('/registro', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -251,20 +251,20 @@ app.get('/registro', (req, res) => {
     </html>
   `);
 });
- 
+
 app.post('/registro', async (req, res) => {
   const nombre = (req.body.nombre || '').trim().slice(0, 100);
   const telefono = (req.body.telefono || '').trim().slice(0, 20);
- 
+
   if (!nombre) return res.status(400).send('El nombre es requerido.');
- 
+
   const id = Date.now().toString(36).slice(-6).toUpperCase();
   const cliente = { id, nombre, telefono, sellos: 0 };
- 
+
   try {
     await crearCliente(cliente);
     const walletLink = await generarWalletLink(cliente);
- 
+
     res.send(`
       <!DOCTYPE html>
       <html lang="es">
@@ -297,10 +297,10 @@ app.post('/registro', async (req, res) => {
     res.status(500).send('Error al crear la tarjeta. Intentá de nuevo.');
   }
 });
- 
+
 app.get('/panel', requireAuth, async (req, res) => {
   const clientes = await obtenerTodosLosClientes();
- 
+
   const lista = clientes.map(c => `
     <tr>
       <td>#${c.id}</td>
@@ -320,7 +320,7 @@ app.get('/panel', requireAuth, async (req, res) => {
       </td>
     </tr>
   `).join('');
- 
+
   res.send(`
     <!DOCTYPE html>
     <html lang="es">
@@ -352,40 +352,40 @@ app.get('/panel', requireAuth, async (req, res) => {
     </html>
   `);
 });
- 
+
 app.post('/sello', requireAuth, async (req, res) => {
   const { id } = req.body;
   const cliente = await obtenerCliente(id);
   if (!cliente) return res.status(404).send('Cliente no encontrado');
- 
+
   const nuevosSellos = Math.min(Number(cliente.sellos) + 1, 10);
   await actualizarSellosDB(id, nuevosSellos);
- 
+
   try {
     await actualizarSellosWallet({ ...cliente, sellos: nuevosSellos });
   } catch (err) {
     console.error('Error actualizando wallet:', err.message);
   }
- 
+
   res.redirect('/panel');
 });
- 
+
 app.post('/canjear', requireAuth, async (req, res) => {
   const { id } = req.body;
   const cliente = await obtenerCliente(id);
   if (!cliente) return res.status(404).send('Cliente no encontrado');
- 
+
   await actualizarSellosDB(id, 0);
- 
+
   try {
     await actualizarSellosWallet({ ...cliente, sellos: 0 });
   } catch (err) {
     console.error('Error actualizando wallet:', err.message);
   }
- 
+
   res.redirect('/panel');
 });
- 
+
 app.get('/qr', async (req, res) => {
   const url = `${req.protocol}://${req.get('host')}/registro`;
   const qr = await QRCode.toDataURL(url, { width: 400, margin: 2 });
@@ -415,7 +415,107 @@ app.get('/qr', async (req, res) => {
     </html>
   `);
 });
- 
+
+// ── Escanear QR del cliente ────────────────────────────────
+app.get('/escanear', requireAuth, (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Escanear Cliente</title>
+      <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, sans-serif; background: #00ADEF; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
+        .card { background: white; border-radius: 20px; padding: 24px; max-width: 400px; width: 100%; text-align: center; }
+        h2 { color: #00ADEF; font-size: 20px; margin-bottom: 6px; }
+        p { color: #666; font-size: 14px; margin-bottom: 20px; }
+        #reader { width: 100%; border-radius: 12px; overflow: hidden; }
+        #resultado { margin-top: 16px; padding: 14px; border-radius: 12px; font-size: 15px; display: none; }
+        #resultado.ok { background: #dcfce7; color: #166534; }
+        #resultado.error { background: #fee2e2; color: #991b1b; }
+        .volver { display: block; margin-top: 16px; color: #00ADEF; font-size: 14px; text-decoration: none; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h2>Escanear cliente</h2>
+        <p>Apuntá la cámara al QR del cliente</p>
+        <div id="reader"></div>
+        <div id="resultado"></div>
+        <a class="volver" href="/panel">← Volver al panel</a>
+      </div>
+      <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+      <script>
+        let escaneando = true;
+        const resultado = document.getElementById('resultado');
+
+        const scanner = new Html5Qrcode('reader');
+        scanner.start(
+          { facingMode: 'environment' },
+          { fps: 10, qrbox: { width: 250, height: 250 } },
+          async (texto) => {
+            if (!escaneando) return;
+            escaneando = false;
+            scanner.stop();
+
+            resultado.style.display = 'block';
+            resultado.className = '';
+            resultado.textContent = 'Agregando sello...';
+
+            try {
+              const res = await fetch('/api/sello/' + texto, { method: 'POST' });
+              const data = await res.json();
+              if (res.ok) {
+                resultado.className = 'ok';
+                resultado.textContent = '✓ Sello agregado a ' + data.nombre + ' (' + data.sellos + '/10)';
+                setTimeout(() => {
+                  escaneando = true;
+                  resultado.style.display = 'none';
+                  scanner.start(
+                    { facingMode: 'environment' },
+                    { fps: 10, qrbox: { width: 250, height: 250 } },
+                    arguments.callee,
+                    () => {}
+                  );
+                }, 2500);
+              } else {
+                resultado.className = 'error';
+                resultado.textContent = '✗ ' + (data.error || 'Cliente no encontrado');
+                setTimeout(() => { escaneando = true; resultado.style.display = 'none'; }, 2500);
+              }
+            } catch (e) {
+              resultado.className = 'error';
+              resultado.textContent = '✗ Error de conexión';
+              setTimeout(() => { escaneando = true; resultado.style.display = 'none'; }, 2500);
+            }
+          },
+          () => {}
+        );
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+app.post('/api/sello/:id', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const cliente = await obtenerCliente(id);
+  if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
+
+  const nuevosSellos = Math.min(Number(cliente.sellos) + 1, 10);
+  await actualizarSellosDB(id, nuevosSellos);
+
+  try {
+    await actualizarSellosWallet({ ...cliente, sellos: nuevosSellos });
+  } catch (err) {
+    console.error('Error actualizando wallet:', err.message);
+  }
+
+  res.json({ nombre: cliente.nombre, sellos: nuevosSellos });
+});
+
 // ── Arranque ───────────────────────────────────────────────
 inicializarDB()
   .then(() => {
@@ -430,4 +530,3 @@ inicializarDB()
     console.error('❌ Error conectando a la base de datos:', err);
     process.exit(1);
   });
- 
