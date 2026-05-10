@@ -3,7 +3,7 @@ const express = require('express');
 const { GoogleAuth } = require('google-auth-library');
 const jwt = require('jsonwebtoken');
 const QRCode = require('qrcode');
-const path = require('path');
+const { createClient } = require('@libsql/client');
 
 const app = express();
 app.use(express.json());
@@ -13,13 +13,54 @@ app.use(express.static('public'));
 const ISSUER_ID = process.env.ISSUER_ID;
 const CLASS_ID = process.env.CLASS_ID;
 
-// Base de datos simple en memoria (después migraremos a Firebase)
-let clientes = {};
+// ── Base de datos Turso ────────────────────────────────────
+const db = createClient({
+  url: process.env.TURSO_URL,
+  authToken: process.env.TURSO_TOKEN,
+});
 
-// Parsear credenciales desde variable de entorno
+async function inicializarDB() {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS clientes (
+      id TEXT PRIMARY KEY,
+      nombre TEXT NOT NULL,
+      telefono TEXT DEFAULT '',
+      sellos INTEGER DEFAULT 0,
+      creado_en TEXT DEFAULT (datetime('now'))
+    )
+  `);
+}
+
+async function obtenerCliente(id) {
+  const result = await db.execute({
+    sql: 'SELECT * FROM clientes WHERE id = ?',
+    args: [id],
+  });
+  return result.rows[0] || null;
+}
+
+async function crearCliente(cliente) {
+  await db.execute({
+    sql: 'INSERT INTO clientes (id, nombre, telefono, sellos) VALUES (?, ?, ?, ?)',
+    args: [cliente.id, cliente.nombre, cliente.telefono, cliente.sellos],
+  });
+}
+
+async function actualizarSellosDB(id, sellos) {
+  await db.execute({
+    sql: 'UPDATE clientes SET sellos = ? WHERE id = ?',
+    args: [sellos, id],
+  });
+}
+
+async function obtenerTodosLosClientes() {
+  const result = await db.execute('SELECT * FROM clientes ORDER BY creado_en DESC');
+  return result.rows;
+}
+
+// ── Credenciales Google ────────────────────────────────────
 const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
 
-// Autenticación con Google
 const auth = new GoogleAuth({
   credentials,
   scopes: ['https://www.googleapis.com/auth/wallet_object.issuer'],
@@ -29,7 +70,6 @@ const auth = new GoogleAuth({
 async function generarWalletLink(cliente) {
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
 
-  // Crear objeto en Google Wallet
   const client = await auth.getClient();
   const loyaltyObject = {
     id: objectId,
@@ -44,7 +84,9 @@ async function generarWalletLink(cliente) {
     textModulesData: [
       {
         header: 'Próxima recompensa',
-        body: cliente.sellos >= 10 ? '¡Empanada gratis disponible! 🎉' : `${10 - cliente.sellos} sellos más para tu empanada gratis`,
+        body: cliente.sellos >= 10
+          ? '¡Empanada gratis disponible! 🎉'
+          : `${10 - cliente.sellos} sellos más para tu empanada gratis`,
         id: 'next_reward',
       },
     ],
@@ -65,7 +107,6 @@ async function generarWalletLink(cliente) {
     if (err.response?.status !== 409) throw err;
   }
 
-  // Generar JWT
   const claims = {
     iss: credentials.client_email,
     aud: 'google',
@@ -81,7 +122,7 @@ async function generarWalletLink(cliente) {
 }
 
 // ── Actualizar sellos en Google Wallet ─────────────────────
-async function actualizarSellos(cliente) {
+async function actualizarSellosWallet(cliente) {
   const client = await auth.getClient();
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
 
@@ -96,7 +137,9 @@ async function actualizarSellos(cliente) {
       textModulesData: [
         {
           header: 'Próxima recompensa',
-          body: cliente.sellos >= 10 ? '¡Empanada gratis disponible! 🎉' : `${10 - cliente.sellos} sellos más para tu empanada gratis`,
+          body: cliente.sellos >= 10
+            ? '¡Empanada gratis disponible! 🎉'
+            : `${10 - cliente.sellos} sellos más para tu empanada gratis`,
           id: 'next_reward',
         },
       ],
@@ -106,7 +149,6 @@ async function actualizarSellos(cliente) {
 
 // ── RUTAS ──────────────────────────────────────────────────
 
-// Página de registro (cliente escanea el QR)
 app.get('/registro', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -138,8 +180,8 @@ app.get('/registro', (req, res) => {
           <p>☕ Acumulá 10 sellos y ganás una empanada gratis</p>
         </div>
         <form action="/registro" method="POST">
-          <input type="text" name="nombre" placeholder="Tu nombre" required>
-          <input type="tel" name="telefono" placeholder="Tu teléfono (opcional)">
+          <input type="text" name="nombre" placeholder="Tu nombre" required maxlength="100">
+          <input type="tel" name="telefono" placeholder="Tu teléfono (opcional)" maxlength="20">
           <button type="submit">Unirme al club →</button>
         </form>
         <div class="footer">Tu tarjeta se agrega directo a Google Wallet</div>
@@ -149,16 +191,19 @@ app.get('/registro', (req, res) => {
   `);
 });
 
-// Procesar registro
 app.post('/registro', async (req, res) => {
-  const { nombre, telefono } = req.body;
-  const id = Date.now().toString().slice(-6);
+  const nombre = (req.body.nombre || '').trim().slice(0, 100);
+  const telefono = (req.body.telefono || '').trim().slice(0, 20);
 
-  const cliente = { id, nombre, telefono: telefono || '', sellos: 0 };
-  clientes[id] = cliente;
+  if (!nombre) return res.status(400).send('El nombre es requerido.');
+
+  const id = Date.now().toString(36).slice(-6).toUpperCase();
+  const cliente = { id, nombre, telefono, sellos: 0 };
 
   try {
+    await crearCliente(cliente);
     const walletLink = await generarWalletLink(cliente);
+
     res.send(`
       <!DOCTYPE html>
       <html lang="es">
@@ -180,9 +225,7 @@ app.post('/registro', async (req, res) => {
         <div class="card">
           <h1>¡Bienvenido, ${nombre}! 🎉</h1>
           <p>Tu tarjeta de sellos está lista. Agregala a Google Wallet con un toque.</p>
-          <a class="wallet-btn" href="${walletLink}">
-            + Agregar a Google Wallet
-          </a>
+          <a class="wallet-btn" href="${walletLink}">+ Agregar a Google Wallet</a>
           <div class="id">Tu número de cliente: #${id}</div>
         </div>
       </body>
@@ -194,9 +237,10 @@ app.post('/registro', async (req, res) => {
   }
 });
 
-// Panel de control (para vos)
-app.get('/panel', (req, res) => {
-  const lista = Object.values(clientes).map(c => `
+app.get('/panel', async (req, res) => {
+  const clientes = await obtenerTodosLosClientes();
+
+  const lista = clientes.map(c => `
     <tr>
       <td>#${c.id}</td>
       <td>${c.nombre}</td>
@@ -248,15 +292,16 @@ app.get('/panel', (req, res) => {
   `);
 });
 
-// Agregar sello
 app.post('/sello', async (req, res) => {
   const { id } = req.body;
-  if (!clientes[id]) return res.status(404).send('Cliente no encontrado');
+  const cliente = await obtenerCliente(id);
+  if (!cliente) return res.status(404).send('Cliente no encontrado');
 
-  clientes[id].sellos = Math.min(clientes[id].sellos + 1, 10);
+  const nuevosSellos = Math.min(Number(cliente.sellos) + 1, 10);
+  await actualizarSellosDB(id, nuevosSellos);
 
   try {
-    await actualizarSellos(clientes[id]);
+    await actualizarSellosWallet({ ...cliente, sellos: nuevosSellos });
   } catch (err) {
     console.error('Error actualizando wallet:', err.message);
   }
@@ -264,15 +309,15 @@ app.post('/sello', async (req, res) => {
   res.redirect('/panel');
 });
 
-// Canjear recompensa
 app.post('/canjear', async (req, res) => {
   const { id } = req.body;
-  if (!clientes[id]) return res.status(404).send('Cliente no encontrado');
+  const cliente = await obtenerCliente(id);
+  if (!cliente) return res.status(404).send('Cliente no encontrado');
 
-  clientes[id].sellos = 0;
+  await actualizarSellosDB(id, 0);
 
   try {
-    await actualizarSellos(clientes[id]);
+    await actualizarSellosWallet({ ...cliente, sellos: 0 });
   } catch (err) {
     console.error('Error actualizando wallet:', err.message);
   }
@@ -280,7 +325,6 @@ app.post('/canjear', async (req, res) => {
   res.redirect('/panel');
 });
 
-// Generar QR para el mostrador
 app.get('/qr', async (req, res) => {
   const url = `${req.protocol}://${req.get('host')}/registro`;
   const qr = await QRCode.toDataURL(url, { width: 400, margin: 2 });
@@ -311,9 +355,17 @@ app.get('/qr', async (req, res) => {
   `);
 });
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`✅ Servidor corriendo en http://localhost:${process.env.PORT || 3000}`);
-  console.log(`   Registro:  http://localhost:3000/registro`);
-  console.log(`   Panel:     http://localhost:3000/panel`);
-  console.log(`   QR:        http://localhost:3000/qr`);
-})
+// ── Arranque ───────────────────────────────────────────────
+inicializarDB()
+  .then(() => {
+    app.listen(process.env.PORT || 3000, () => {
+      console.log(`✅ Servidor corriendo en http://localhost:${process.env.PORT || 3000}`);
+      console.log(`   Registro:  http://localhost:3000/registro`);
+      console.log(`   Panel:     http://localhost:3000/panel`);
+      console.log(`   QR:        http://localhost:3000/qr`);
+    });
+  })
+  .catch(err => {
+    console.error('❌ Error conectando a la base de datos:', err);
+    process.exit(1);
+  });
