@@ -4,21 +4,32 @@ const { GoogleAuth } = require('google-auth-library');
 const jwt = require('jsonwebtoken');
 const QRCode = require('qrcode');
 const { createClient } = require('@libsql/client');
-
+const cookieSession = require('cookie-session');
+ 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
-
+app.use(cookieSession({
+  name: 'session',
+  keys: [process.env.SESSION_SECRET || 'gauchada-secret'],
+  maxAge: 8 * 60 * 60 * 1000,
+}));
+ 
+function requireAuth(req, res, next) {
+  if (req.session.autenticado) return next();
+  res.redirect('/login');
+}
+ 
 const ISSUER_ID = process.env.ISSUER_ID;
 const CLASS_ID = process.env.CLASS_ID;
-
+ 
 // ── Base de datos Turso ────────────────────────────────────
 const db = createClient({
   url: process.env.TURSO_URL,
   authToken: process.env.TURSO_TOKEN,
 });
-
+ 
 async function inicializarDB() {
   await db.execute(`
     CREATE TABLE IF NOT EXISTS clientes (
@@ -30,7 +41,7 @@ async function inicializarDB() {
     )
   `);
 }
-
+ 
 async function obtenerCliente(id) {
   const result = await db.execute({
     sql: 'SELECT * FROM clientes WHERE id = ?',
@@ -38,38 +49,38 @@ async function obtenerCliente(id) {
   });
   return result.rows[0] || null;
 }
-
+ 
 async function crearCliente(cliente) {
   await db.execute({
     sql: 'INSERT INTO clientes (id, nombre, telefono, sellos) VALUES (?, ?, ?, ?)',
     args: [cliente.id, cliente.nombre, cliente.telefono, cliente.sellos],
   });
 }
-
+ 
 async function actualizarSellosDB(id, sellos) {
   await db.execute({
     sql: 'UPDATE clientes SET sellos = ? WHERE id = ?',
     args: [sellos, id],
   });
 }
-
+ 
 async function obtenerTodosLosClientes() {
   const result = await db.execute('SELECT * FROM clientes ORDER BY creado_en DESC');
   return result.rows;
 }
-
+ 
 // ── Credenciales Google ────────────────────────────────────
 const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-
+ 
 const auth = new GoogleAuth({
   credentials,
   scopes: ['https://www.googleapis.com/auth/wallet_object.issuer'],
 });
-
+ 
 // ── Generar link de Google Wallet ──────────────────────────
 async function generarWalletLink(cliente) {
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
-
+ 
   const client = await auth.getClient();
   const loyaltyObject = {
     id: objectId,
@@ -96,7 +107,7 @@ async function generarWalletLink(cliente) {
       alternateText: `#${cliente.id}`,
     },
   };
-
+ 
   try {
     await client.request({
       url: `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject`,
@@ -106,7 +117,7 @@ async function generarWalletLink(cliente) {
   } catch (err) {
     if (err.response?.status !== 409) throw err;
   }
-
+ 
   const claims = {
     iss: credentials.client_email,
     aud: 'google',
@@ -116,16 +127,16 @@ async function generarWalletLink(cliente) {
       loyaltyObjects: [{ id: objectId }],
     },
   };
-
+ 
   const token = jwt.sign(claims, credentials.private_key, { algorithm: 'RS256' });
   return `https://pay.google.com/gp/v/save/${token}`;
 }
-
+ 
 // ── Actualizar sellos en Google Wallet ─────────────────────
 async function actualizarSellosWallet(cliente) {
   const client = await auth.getClient();
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
-
+ 
   await client.request({
     url: `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(objectId)}`,
     method: 'PATCH',
@@ -146,9 +157,59 @@ async function actualizarSellosWallet(cliente) {
     },
   });
 }
-
+ 
 // ── RUTAS ──────────────────────────────────────────────────
-
+ 
+app.get('/login', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Acceso Panel</title>
+      <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, sans-serif; background: #00ADEF; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .card { background: white; border-radius: 20px; padding: 32px 24px; max-width: 360px; width: 100%; text-align: center; }
+        .logo { font-size: 24px; font-weight: 800; color: #00ADEF; margin-bottom: 4px; }
+        .subtitle { color: #666; font-size: 14px; margin-bottom: 28px; }
+        input { width: 100%; padding: 14px 16px; border: 2px solid #e0e0e0; border-radius: 12px; font-size: 16px; margin-bottom: 12px; outline: none; transition: border-color 0.2s; }
+        input:focus { border-color: #00ADEF; }
+        button { width: 100%; padding: 16px; background: #00ADEF; color: white; border: none; border-radius: 12px; font-size: 17px; font-weight: 600; cursor: pointer; }
+        .error { color: #e53e3e; font-size: 14px; margin-bottom: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="logo">LA GAUCHADA</div>
+        <div class="subtitle">Acceso al panel</div>
+        ${req.query.error ? '<div class="error">Contraseña incorrecta</div>' : ''}
+        <form action="/login" method="POST">
+          <input type="password" name="password" placeholder="Contraseña" required autofocus>
+          <button type="submit">Entrar →</button>
+        </form>
+      </div>
+    </body>
+    </html>
+  `);
+});
+ 
+app.post('/login', (req, res) => {
+  const { password } = req.body;
+  if (password === process.env.PANEL_PASSWORD) {
+    req.session.autenticado = true;
+    res.redirect('/panel');
+  } else {
+    res.redirect('/login?error=1');
+  }
+});
+ 
+app.get('/logout', (req, res) => {
+  req.session = null;
+  res.redirect('/login');
+});
+ 
 app.get('/registro', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -190,20 +251,20 @@ app.get('/registro', (req, res) => {
     </html>
   `);
 });
-
+ 
 app.post('/registro', async (req, res) => {
   const nombre = (req.body.nombre || '').trim().slice(0, 100);
   const telefono = (req.body.telefono || '').trim().slice(0, 20);
-
+ 
   if (!nombre) return res.status(400).send('El nombre es requerido.');
-
+ 
   const id = Date.now().toString(36).slice(-6).toUpperCase();
   const cliente = { id, nombre, telefono, sellos: 0 };
-
+ 
   try {
     await crearCliente(cliente);
     const walletLink = await generarWalletLink(cliente);
-
+ 
     res.send(`
       <!DOCTYPE html>
       <html lang="es">
@@ -236,10 +297,10 @@ app.post('/registro', async (req, res) => {
     res.status(500).send('Error al crear la tarjeta. Intentá de nuevo.');
   }
 });
-
-app.get('/panel', async (req, res) => {
+ 
+app.get('/panel', requireAuth, async (req, res) => {
   const clientes = await obtenerTodosLosClientes();
-
+ 
   const lista = clientes.map(c => `
     <tr>
       <td>#${c.id}</td>
@@ -259,7 +320,7 @@ app.get('/panel', async (req, res) => {
       </td>
     </tr>
   `).join('');
-
+ 
   res.send(`
     <!DOCTYPE html>
     <html lang="es">
@@ -278,7 +339,7 @@ app.get('/panel', async (req, res) => {
       </style>
     </head>
     <body>
-      <h1>Panel La Gauchada 🥟</h1>
+      <h1>Panel La Gauchada ☕</h1>
       <table>
         <thead>
           <tr><th>#</th><th>Nombre</th><th>Teléfono</th><th>Sellos</th><th>Acción</th></tr>
@@ -291,40 +352,40 @@ app.get('/panel', async (req, res) => {
     </html>
   `);
 });
-
-app.post('/sello', async (req, res) => {
+ 
+app.post('/sello', requireAuth, async (req, res) => {
   const { id } = req.body;
   const cliente = await obtenerCliente(id);
   if (!cliente) return res.status(404).send('Cliente no encontrado');
-
+ 
   const nuevosSellos = Math.min(Number(cliente.sellos) + 1, 10);
   await actualizarSellosDB(id, nuevosSellos);
-
+ 
   try {
     await actualizarSellosWallet({ ...cliente, sellos: nuevosSellos });
   } catch (err) {
     console.error('Error actualizando wallet:', err.message);
   }
-
+ 
   res.redirect('/panel');
 });
-
-app.post('/canjear', async (req, res) => {
+ 
+app.post('/canjear', requireAuth, async (req, res) => {
   const { id } = req.body;
   const cliente = await obtenerCliente(id);
   if (!cliente) return res.status(404).send('Cliente no encontrado');
-
+ 
   await actualizarSellosDB(id, 0);
-
+ 
   try {
     await actualizarSellosWallet({ ...cliente, sellos: 0 });
   } catch (err) {
     console.error('Error actualizando wallet:', err.message);
   }
-
+ 
   res.redirect('/panel');
 });
-
+ 
 app.get('/qr', async (req, res) => {
   const url = `${req.protocol}://${req.get('host')}/registro`;
   const qr = await QRCode.toDataURL(url, { width: 400, margin: 2 });
@@ -354,7 +415,7 @@ app.get('/qr', async (req, res) => {
     </html>
   `);
 });
-
+ 
 // ── Arranque ───────────────────────────────────────────────
 inicializarDB()
   .then(() => {
@@ -369,3 +430,4 @@ inicializarDB()
     console.error('❌ Error conectando a la base de datos:', err);
     process.exit(1);
   });
+ 
