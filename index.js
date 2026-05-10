@@ -278,7 +278,7 @@ app.get('/panel', async (req, res) => {
       </style>
     </head>
     <body>
-      <h1>Panel La Gauchada ☕</h1>
+      <h1>Panel La Gauchada 🥟</h1>
       <table>
         <thead>
           <tr><th>#</th><th>Nombre</th><th>Teléfono</th><th>Sellos</th><th>Acción</th></tr>
