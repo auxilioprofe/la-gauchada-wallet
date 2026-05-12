@@ -432,6 +432,15 @@ app.get('/escanear', requireAuth, (req, res) => {
         h2 { color: #00ADEF; font-size: 20px; margin-bottom: 6px; }
         p { color: #666; font-size: 14px; margin-bottom: 20px; }
         #reader { width: 100%; border-radius: 12px; overflow: hidden; }
+        #confirmar { display: none; margin-top: 16px; }
+        #confirmar .nombre { font-size: 18px; font-weight: 600; color: #333; margin-bottom: 4px; }
+        #confirmar .sellos-actual { font-size: 13px; color: #999; margin-bottom: 16px; }
+        #confirmar label { font-size: 14px; color: #555; display: block; margin-bottom: 8px; }
+        #cantidad { width: 80px; padding: 10px; font-size: 24px; text-align: center; border: 2px solid #e0e0e0; border-radius: 12px; outline: none; }
+        #cantidad:focus { border-color: #00ADEF; }
+        .btns { display: flex; gap: 10px; margin-top: 16px; }
+        .btn-confirmar { flex: 1; padding: 14px; background: #00ADEF; color: white; border: none; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer; }
+        .btn-cancelar { flex: 1; padding: 14px; background: #f5f5f5; color: #666; border: none; border-radius: 12px; font-size: 16px; cursor: pointer; }
         #resultado { margin-top: 16px; padding: 14px; border-radius: 12px; font-size: 15px; display: none; }
         #resultado.ok { background: #dcfce7; color: #166534; }
         #resultado.error { background: #fee2e2; color: #991b1b; }
@@ -441,70 +450,126 @@ app.get('/escanear', requireAuth, (req, res) => {
     <body>
       <div class="card">
         <h2>Escanear cliente</h2>
-        <p>Apuntá la cámara al QR del cliente</p>
+        <p id="instruccion">Apuntá la cámara al QR del cliente</p>
         <div id="reader"></div>
+
+        <div id="confirmar">
+          <div class="nombre" id="cliente-nombre"></div>
+          <div class="sellos-actual" id="cliente-sellos"></div>
+          <label>¿Cuántas empanadas compró?</label>
+          <input type="number" id="cantidad" min="1" max="10" value="1">
+          <div class="btns">
+            <button class="btn-cancelar" id="btn-cancelar">Cancelar</button>
+            <button class="btn-confirmar" id="btn-confirmar">Agregar sellos</button>
+          </div>
+        </div>
+
         <div id="resultado"></div>
         <a class="volver" href="/panel">← Volver al panel</a>
       </div>
       <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
       <script>
         let escaneando = true;
+        let clienteId = null;
         const resultado = document.getElementById('resultado');
+        const confirmar = document.getElementById('confirmar');
+        const instruccion = document.getElementById('instruccion');
 
         const scanner = new Html5Qrcode('reader');
-        scanner.start(
-          { facingMode: 'environment' },
-          { fps: 10, qrbox: { width: 250, height: 250 } },
-          async (texto) => {
-            if (!escaneando) return;
-            escaneando = false;
-            scanner.stop();
 
-            resultado.style.display = 'block';
-            resultado.className = '';
-            resultado.textContent = 'Agregando sello...';
+        function iniciarScanner() {
+          escaneando = true;
+          clienteId = null;
+          confirmar.style.display = 'none';
+          resultado.style.display = 'none';
+          instruccion.textContent = 'Apuntá la cámara al QR del cliente';
+          document.getElementById('cantidad').value = 1;
 
-            try {
-              const res = await fetch('/api/sello/' + texto, { method: 'POST' });
-              const data = await res.json();
-              if (res.ok) {
-                resultado.className = 'ok';
-                resultado.textContent = '✓ Sello agregado a ' + data.nombre + ' (' + data.sellos + '/10)';
-                setTimeout(() => {
-                  escaneando = true;
-                  resultado.style.display = 'none';
-                  scanner.start(
-                    { facingMode: 'environment' },
-                    { fps: 10, qrbox: { width: 250, height: 250 } },
-                    arguments.callee,
-                    () => {}
-                  );
-                }, 2500);
-              } else {
+          scanner.start(
+            { facingMode: 'environment' },
+            { fps: 10, qrbox: { width: 250, height: 250 } },
+            async (texto) => {
+              if (!escaneando) return;
+              escaneando = false;
+              scanner.stop();
+
+              // Buscar cliente
+              try {
+                const res = await fetch('/api/cliente/' + texto);
+                const data = await res.json();
+                if (res.ok) {
+                  clienteId = texto;
+                  document.getElementById('cliente-nombre').textContent = data.nombre;
+                  document.getElementById('cliente-sellos').textContent = 'Sellos actuales: ' + data.sellos + '/10';
+                  instruccion.textContent = '';
+                  confirmar.style.display = 'block';
+                } else {
+                  resultado.style.display = 'block';
+                  resultado.className = 'error';
+                  resultado.textContent = '✗ Cliente no encontrado';
+                  setTimeout(iniciarScanner, 2500);
+                }
+              } catch (e) {
+                resultado.style.display = 'block';
                 resultado.className = 'error';
-                resultado.textContent = '✗ ' + (data.error || 'Cliente no encontrado');
-                setTimeout(() => { escaneando = true; resultado.style.display = 'none'; }, 2500);
+                resultado.textContent = '✗ Error de conexión';
+                setTimeout(iniciarScanner, 2500);
               }
-            } catch (e) {
+            },
+            () => {}
+          );
+        }
+
+        document.getElementById('btn-cancelar').addEventListener('click', iniciarScanner);
+
+        document.getElementById('btn-confirmar').addEventListener('click', async () => {
+          const cantidad = parseInt(document.getElementById('cantidad').value) || 1;
+          confirmar.style.display = 'none';
+          resultado.style.display = 'block';
+          resultado.className = '';
+          resultado.textContent = 'Agregando sellos...';
+
+          try {
+            const res = await fetch('/api/sello/' + clienteId, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ cantidad }),
+            });
+            const data = await res.json();
+            if (res.ok) {
+              resultado.className = 'ok';
+              resultado.textContent = '✓ ' + cantidad + ' sello(s) agregado(s) a ' + data.nombre + ' (' + data.sellos + '/10)';
+            } else {
               resultado.className = 'error';
-              resultado.textContent = '✗ Error de conexión';
-              setTimeout(() => { escaneando = true; resultado.style.display = 'none'; }, 2500);
+              resultado.textContent = '✗ ' + (data.error || 'Error al agregar sellos');
             }
-          },
-          () => {}
-        );
+          } catch (e) {
+            resultado.className = 'error';
+            resultado.textContent = '✗ Error de conexión';
+          }
+          setTimeout(iniciarScanner, 3000);
+        });
+
+        iniciarScanner();
       </script>
     </body>
     </html>
   `);
 });
 
-app.get('/api/cliente/:id', requireAuth, async (req, res) => {   const cliente = await obtenerCliente(req.params.id);   if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });   res.json({ nombre: cliente.nombre, sellos: cliente.sellos }); });  app.post('/api/sello/:id', requireAuth, async (req, res) => {   const { id } = req.params;   const cantidad = Math.max(1, Math.min(10, parseInt(req.body.cantidad) || 1));   const cliente = await obtenerCliente(id);   if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });    const nuevosSellos = Math.min(Number(cliente.sellos) + cantidad, 10);   await actualizarSellosDB(id, nuevosSellos);    try {     await actualizarSellosWallet({ ...cliente, sellos: nuevosSellos });   } catch (err) {     console.error('Error actualizando wallet:', err.message);   }    res.json({ nombre: cliente.nombre, sellos: nuevosSellos }); });
+app.get('/api/cliente/:id', requireAuth, async (req, res) => {
+  const cliente = await obtenerCliente(req.params.id);
+  if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
+  res.json({ nombre: cliente.nombre, sellos: cliente.sellos });
+});
+
+app.post('/api/sello/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
+  const cantidad = Math.max(1, Math.min(10, parseInt(req.body.cantidad) || 1));
   const cliente = await obtenerCliente(id);
   if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
 
-  const nuevosSellos = Math.min(Number(cliente.sellos) + 1, 10);
+  const nuevosSellos = Math.min(Number(cliente.sellos) + cantidad, 10);
   await actualizarSellosDB(id, nuevosSellos);
 
   try {
