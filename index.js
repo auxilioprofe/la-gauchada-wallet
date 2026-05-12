@@ -499,7 +499,7 @@ app.get('/escanear', requireAuth, (req, res) => {
   `);
 });
 
-app.post('/api/sello/:id', requireAuth, async (req, res) => {
+app.get('/api/cliente/:id', requireAuth, async (req, res) => {   const cliente = await obtenerCliente(req.params.id);   if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });   res.json({ nombre: cliente.nombre, sellos: cliente.sellos }); });  app.post('/api/sello/:id', requireAuth, async (req, res) => {   const { id } = req.params;   const cantidad = Math.max(1, Math.min(10, parseInt(req.body.cantidad) || 1));   const cliente = await obtenerCliente(id);   if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });    const nuevosSellos = Math.min(Number(cliente.sellos) + cantidad, 10);   await actualizarSellosDB(id, nuevosSellos);    try {     await actualizarSellosWallet({ ...cliente, sellos: nuevosSellos });   } catch (err) {     console.error('Error actualizando wallet:', err.message);   }    res.json({ nombre: cliente.nombre, sellos: nuevosSellos }); });
   const { id } = req.params;
   const cliente = await obtenerCliente(id);
   if (!cliente) return res.status(404).json({ error: 'Cliente no encontrado' });
