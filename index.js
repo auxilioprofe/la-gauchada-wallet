@@ -7,6 +7,9 @@ const { createClient } = require('@libsql/client');
 const cookieSession = require('cookie-session');
 
 const app = express();
+// Render (y cualquier proxy TLS) reenvía por HTTP interno con X-Forwarded-Proto.
+// Sin esto, req.protocol devuelve 'http' y el QR de /qr codifica una URL http://.
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
@@ -128,14 +131,23 @@ async function actualizarWallet(cliente) {
   const client = await auth.getClient();
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
   const { progreso } = calcularPremios(cliente);
-  await client.request({
-    url: `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(objectId)}`,
-    method: 'PATCH',
-    data: {
-      loyaltyPoints: { balance: { int: progreso }, label: 'Sellos' },
-      textModulesData: [{ header: 'Premio', body: walletBody(cliente), id: 'next_reward' }],
-    },
-  });
+  try {
+    await client.request({
+      url: `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(objectId)}`,
+      method: 'PATCH',
+      data: {
+        loyaltyPoints: { balance: { int: progreso }, label: 'Sellos' },
+        textModulesData: [{ header: 'Premio', body: walletBody(cliente), id: 'next_reward' }],
+      },
+    });
+  } catch (err) {
+    // Un 404 acá suele significar que el objectId del PATCH no coincide con el
+    // que se creó en el POST inicial. Logueamos el ID para poder compararlos.
+    const status = err.response?.status;
+    const detalle = err.response?.data?.error?.message || err.message;
+    console.error(`Error wallet: PATCH ${objectId} falló (HTTP ${status || '?'}): ${detalle}`);
+    throw err;
+  }
 }
 
 // ── RUTAS ──────────────────────────────────────────────────
@@ -199,7 +211,7 @@ app.post('/editar/:id', requireAuth, async (req, res) => {
   const empanadas_canjeadas = Math.max(0, parseInt(req.body.empanadas_canjeadas) || 0);
   await editarCliente(id, nombre, telefono, sellos_totales, empanadas_canjeadas);
   const cliente = await obtenerCliente(id);
-  try { await actualizarWallet(cliente); } catch (err) { console.error('Error wallet:', err.message); }
+  try { await actualizarWallet(cliente); } catch (err) { /* ya logueado en actualizarWallet */ }
   res.redirect('/panel');
 });
 
@@ -216,7 +228,7 @@ app.post('/canjear', requireAuth, async (req, res) => {
   if (disponibles < 1) return res.status(400).send('No hay empanadas disponibles');
   await canjearEmpanada(id);
   const clienteActualizado = await obtenerCliente(id);
-  try { await actualizarWallet(clienteActualizado); } catch (err) { console.error('Error wallet:', err.message); }
+  try { await actualizarWallet(clienteActualizado); } catch (err) { /* ya logueado en actualizarWallet */ }
   const restantes = pendientes - 1;
   res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Canje exitoso</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:32px 24px;max-width:400px;width:100%;text-align:center}h1{font-size:24px;color:#22c55e;margin-bottom:12px}p{color:#555;font-size:15px;margin-bottom:8px}.restante{background:#f0f9ff;border-radius:12px;padding:14px;margin:20px 0;color:#00ADEF;font-weight:600;font-size:15px}a{display:block;padding:14px;background:#00ADEF;color:white;border-radius:12px;text-decoration:none;font-size:16px;font-weight:600}</style></head><body><div class="card"><h1>🥟 ¡Canje exitoso!</h1><p><strong>${cliente.nombre}</strong> canjeó una empanada gratis.</p><div class="restante">${restantes > 0 ? `Le quedan ${restantes} empanada${restantes > 1 ? 's' : ''} por canjear` : 'No quedan empanadas pendientes'}</div><a href="/panel">← Volver al panel</a></div></body></html>`);
 });
@@ -228,7 +240,7 @@ app.get('/qr', async (req, res) => {
 });
 
 app.get('/escanear', requireAuth, (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Escanear Cliente</title> <link rel="manifest" href="/manifest.json"> <meta name="theme-color" content="#00ADEF"> <meta name="mobile-web-app-capable" content="yes"><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:24px;max-width:400px;width:100%;text-align:center}h2{color:#00ADEF;font-size:20px;margin-bottom:6px}p{color:#666;font-size:14px;margin-bottom:20px}#reader{width:100%;border-radius:12px;overflow:hidden}#confirmar{display:none;margin-top:16px}#confirmar .nombre{font-size:18px;font-weight:600;color:#333;margin-bottom:4px}#confirmar .info{font-size:13px;color:#999;margin-bottom:16px}#confirmar label{font-size:14px;color:#555;display:block;margin-bottom:8px}#cantidad{width:80px;padding:10px;font-size:24px;text-align:center;border:2px solid #e0e0e0;border-radius:12px;outline:none}#cantidad:focus{border-color:#00ADEF}.btns{display:flex;gap:10px;margin-top:16px}.btn-confirmar{flex:1;padding:14px;background:#00ADEF;color:white;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer}.btn-cancelar{flex:1;padding:14px;background:#f5f5f5;color:#666;border:none;border-radius:12px;font-size:16px;cursor:pointer}#resultado{margin-top:16px;padding:14px;border-radius:12px;font-size:15px;display:none}#resultado.ok{background:#dcfce7;color:#166534}#resultado.error{background:#fee2e2;color:#991b1b}#resultado.premio{background:#fef3c7;color:#92400e;font-weight:600}.volver{display:block;margin-top:16px;color:#00ADEF;font-size:14px;text-decoration:none}</style></head><body><div class="card"><h2>Escanear cliente</h2><p id="instruccion">Apuntá la cámara al QR del cliente</p><div id="reader"></div><div id="confirmar"><div class="nombre" id="cliente-nombre"></div><div class="info" id="cliente-info"></div><label>¿Cuántas empanadas compró?</label><input type="number" id="cantidad" min="1" value="1"><div class="btns"><button class="btn-cancelar" id="btn-cancelar">Cancelar</button><button class="btn-confirmar" id="btn-confirmar">Agregar sellos</button></div></div><div id="resultado"></div><a class="volver" href="/panel">← Volver al panel</a></div><script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script><script>
+  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Escanear Cliente</title> <link rel="manifest" href="/manifest.json"> <meta name="theme-color" content="#00ADEF"> <meta name="mobile-web-app-capable" content="yes"><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:24px;max-width:400px;width:100%;text-align:center}h2{color:#00ADEF;font-size:20px;margin-bottom:6px}p{color:#666;font-size:14px;margin-bottom:20px}#reader{width:100%;border-radius:12px;overflow:hidden}#confirmar{display:none;margin-top:16px}#confirmar .nombre{font-size:18px;font-weight:600;color:#333;margin-bottom:4px}#confirmar .info{font-size:13px;color:#999;margin-bottom:16px}#confirmar label{font-size:14px;color:#555;display:block;margin-bottom:8px}#cantidad{width:80px;padding:10px;font-size:24px;text-align:center;border:2px solid #e0e0e0;border-radius:12px;outline:none}#cantidad:focus{border-color:#00ADEF}.btns{display:flex;gap:10px;margin-top:16px}.btn-confirmar{flex:1;padding:14px;background:#00ADEF;color:white;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer}.btn-cancelar{flex:1;padding:14px;background:#f5f5f5;color:#666;border:none;border-radius:12px;font-size:16px;cursor:pointer}#resultado{margin-top:16px;padding:14px;border-radius:12px;font-size:15px;display:none}#resultado.ok{background:#dcfce7;color:#166534}#resultado.error{background:#fee2e2;color:#991b1b}#resultado.premio{background:#fef3c7;color:#92400e;font-weight:600}#resultado.warn{background:#fef3c7;color:#92400e;text-align:left}.volver{display:block;margin-top:16px;color:#00ADEF;font-size:14px;text-decoration:none}</style></head><body><div class="card"><h2>Escanear cliente</h2><p id="instruccion">Apuntá la cámara al QR del cliente</p><div id="reader"></div><div id="confirmar"><div class="nombre" id="cliente-nombre"></div><div class="info" id="cliente-info"></div><label>¿Cuántas empanadas compró?</label><input type="number" id="cantidad" min="1" value="1"><div class="btns"><button class="btn-cancelar" id="btn-cancelar">Cancelar</button><button class="btn-confirmar" id="btn-confirmar">Agregar sellos</button></div></div><div id="resultado"></div><a class="volver" href="/panel">← Volver al panel</a></div><script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script><script>
     let escaneando=true,clienteId=null;
     const resultado=document.getElementById('resultado'),confirmar=document.getElementById('confirmar'),instruccion=document.getElementById('instruccion');
     const scanner=new Html5Qrcode('reader');
@@ -261,9 +273,10 @@ app.get('/escanear', requireAuth, (req, res) => {
         if(res.ok){
           if(data.disponibles>0){resultado.className='premio';resultado.textContent='🥟 ¡'+data.disponibles+' empanada'+(data.disponibles>1?'s':'')+' gratis disponible'+(data.disponibles>1?'s':'')+' para '+data.nombre+'!';}
           else{resultado.className='ok';resultado.textContent='✓ '+cantidad+' sello(s) agregado(s) a '+data.nombre+' ('+data.progreso+'/10)';}
+          if(data.walletSync===false){resultado.className='warn';resultado.textContent+=' ⚠️ Los sellos se guardaron, pero la tarjeta de Wallet NO se actualizó. Avisá al cliente que puede tardar, o revisá los logs.';}
         }else{resultado.className='error';resultado.textContent='✗ '+(data.error||'Error al agregar sellos');}
       }catch(e){resultado.className='error';resultado.textContent='✗ Error de conexión';}
-      setTimeout(iniciarScanner,3500);
+      setTimeout(iniciarScanner,resultado.className==='warn'?8000:3500);
     });
     iniciarScanner();
   </script></body></html>`);
@@ -284,8 +297,9 @@ app.post('/api/sello/:id', requireAuth, async (req, res) => {
   await agregarSellos(id, cantidad);
   const clienteActualizado = await obtenerCliente(id);
   const { progreso, disponibles } = calcularPremios(clienteActualizado);
-  try { await actualizarWallet(clienteActualizado); } catch (err) { console.error('Error wallet:', err.message); }
-  res.json({ nombre: cliente.nombre, progreso, disponibles });
+  let walletSync = true;
+  try { await actualizarWallet(clienteActualizado); } catch (err) { walletSync = false; }
+  res.json({ nombre: cliente.nombre, progreso, disponibles, walletSync });
 });
 
 inicializarDB()
