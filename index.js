@@ -7,6 +7,9 @@ const { createClient } = require('@libsql/client');
 const cookieSession = require('cookie-session');
 
 const app = express();
+// Render (y cualquier proxy TLS) reenvía por HTTP interno con X-Forwarded-Proto.
+// Sin esto, req.protocol devuelve 'http' y el QR de /qr codifica una URL http://.
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
@@ -22,6 +25,9 @@ function requireAuth(req, res, next) {
 }
 
 const ISSUER_ID = process.env.ISSUER_ID;
+// Normalizado: un espacio o un salto de línea de más al pegarla en el panel del
+// proveedor rompía la comparación exacta del login sin ninguna pista de por qué.
+const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || '').trim();
 const CLASS_ID = process.env.CLASS_ID;
 
 // ── Base de datos Turso ────────────────────────────────────
@@ -151,22 +157,34 @@ async function generarWalletLink(cliente) {
   return `https://pay.google.com/gp/v/save/${token}`;
 }
 
+// Devuelve true si la tarjeta quedó actualizada, false si Google Wallet no está
+// configurado. Si el envío falla, relanza para que quien llama pueda avisarlo.
 async function actualizarWallet(cliente) {
   if (!auth || !credentials) {
     console.warn("⚠️ Google Wallet no está configurado. No se pudo actualizar el wallet del cliente: " + cliente.id);
-    return;
+    return false;
   }
   const client = await auth.getClient();
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
   const { progreso } = calcularPremios(cliente);
-  await client.request({
-    url: `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(objectId)}`,
-    method: 'PATCH',
-    data: {
-      loyaltyPoints: { balance: { int: progreso }, label: 'Sellos' },
-      textModulesData: [{ header: 'Premio', body: walletBody(cliente), id: 'next_reward' }],
-    },
-  });
+  try {
+    await client.request({
+      url: `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(objectId)}`,
+      method: 'PATCH',
+      data: {
+        loyaltyPoints: { balance: { int: progreso }, label: 'Sellos' },
+        textModulesData: [{ header: 'Premio', body: walletBody(cliente), id: 'next_reward' }],
+      },
+    });
+  } catch (err) {
+    // Un 404 acá suele significar que el objectId del PATCH no coincide con el
+    // que se creó en el POST inicial. Logueamos el ID para poder compararlos.
+    const status = err.response?.status;
+    const detalle = err.response?.data?.error?.message || err.message;
+    console.error(`Error wallet: PATCH ${objectId} falló (HTTP ${status || '?'}): ${detalle}`);
+    throw err;
+  }
+  return true;
 }
 
 // ── RUTAS ──────────────────────────────────────────────────
@@ -335,12 +353,16 @@ const UI = {
 };
 
 app.get('/login', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('Acceso Panel')}</head><body><div class="card"><div class="logo"><span>LA GAUCHADA</span> 🥟</div><div class="subtitle">Acceso seguro al panel</div>${req.query.error ? '<div class="error">🔑 Contraseña incorrecta</div>' : ''}<form action="/login" method="POST"><div class="form-group"><label>Contraseña administrativa</label><input type="password" name="password" placeholder="••••••••" required autofocus></div><button type="submit">Entrar al panel →</button></form></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('Acceso Panel')}</head><body><div class="card"><div class="logo"><span>LA GAUCHADA</span> 🥟</div><div class="subtitle">Acceso seguro al panel</div>${req.query.error === '2' ? '<div class="error">⚙️ El servidor no tiene PANEL_PASSWORD configurada. Cargala en las variables de entorno y reintentá.</div>' : req.query.error ? '<div class="error">🔑 Contraseña incorrecta</div>' : ''}<form action="/login" method="POST"><div class="form-group"><label>Contraseña administrativa</label><input type="password" name="password" placeholder="••••••••" required autofocus></div><button type="submit">Entrar al panel →</button></form></div></body></html>`);
 });
 
 app.post('/login', (req, res) => {
-  const panelPassword = process.env.PANEL_PASSWORD || 'gauchada';
-  if (req.body.password === panelPassword) { req.session.autenticado = true; res.redirect('/panel'); }
+  // Sin contraseña configurada el panel queda cerrado, nunca abierto con una
+  // contraseña de respaldo fija: la URL es pública y desde el panel se otorgan
+  // sellos y se canjean premios.
+  if (!PANEL_PASSWORD) return res.redirect('/login?error=2');
+  const ingresada = (req.body.password || '').trim();
+  if (ingresada && ingresada === PANEL_PASSWORD) { req.session.autenticado = true; res.redirect('/panel'); }
   else res.redirect('/login?error=1');
 });
 
@@ -413,7 +435,7 @@ app.post('/editar/:id', requireAuth, async (req, res) => {
   const empanadas_canjeadas = Math.max(0, parseInt(req.body.empanadas_canjeadas) || 0);
   await editarCliente(id, nombre, telefono, sellos_totales, empanadas_canjeadas);
   const cliente = await obtenerCliente(id);
-  try { await actualizarWallet(cliente); } catch (err) { console.error('Error wallet:', err.message); }
+  try { await actualizarWallet(cliente); } catch (err) { /* ya logueado en actualizarWallet */ }
   res.redirect('/panel');
 });
 
@@ -430,7 +452,7 @@ app.post('/canjear', requireAuth, async (req, res) => {
   if (disponibles < 1) return res.status(400).send('No hay empanadas disponibles');
   await canjearEmpanada(id);
   const clienteActualizado = await obtenerCliente(id);
-  try { await actualizarWallet(clienteActualizado); } catch (err) { console.error('Error wallet:', err.message); }
+  try { await actualizarWallet(clienteActualizado); } catch (err) { /* ya logueado en actualizarWallet */ }
   const restantes = pendientes - 1;
   res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('Canje Exitoso')}<style>.success-icon { font-size: 56px; margin-bottom: 20px; } h1 { font-size: 26px; color: var(--success); margin-bottom: 12px; font-weight: 800; } .client-details { background: #f8fafc; border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin: 24px 0; font-size: 15px; } .pill { display: inline-block; padding: 8px 16px; border-radius: 9999px; background: var(--primary-light); color: var(--primary-dark); font-weight: 700; margin-top: 12px; font-size: 14px; }</style></head><body><div class="card"><div class="success-icon">🥟🎉</div><h1>¡Canje Exitoso!</h1><p>Se ha procesado correctamente la entrega del premio.</p><div class="client-details"><p>Cliente: <strong>${cliente.nombre}</strong></p><div class="pill">${restantes > 0 ? `Le quedan ${restantes} empanada${restantes > 1 ? 's' : ''} gratis` : 'No quedan premios pendientes'}</div></div><a class="btn" href="/panel">← Volver al panel</a></div></body></html>`);
 });
@@ -442,7 +464,8 @@ app.get('/qr', async (req, res) => {
 });
 
 app.get('/escanear', requireAuth, (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Escanear Cliente | La Gauchada</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"><style>:root { --primary: #0ea5e9; --primary-dark: #0284c7; --primary-light: rgba(14, 165, 233, 0.15); --bg: #0f172a; --card-bg: #ffffff; --text: #0f172a; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --warning: #f59e0b; --danger: #ef4444; --shadow-lg: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1); } * { box-sizing: border-box; margin: 0; padding: 0; } body { font-family: 'Inter', -apple-system, sans-serif; background: radial-gradient(circle at top, #1e1b4b 0%, #0f172a 100%); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; } .card { background: var(--card-bg); border-radius: 24px; padding: 32px 24px; max-width: 440px; width: 100%; box-shadow: var(--shadow-lg); text-align: center; border: 1px solid rgba(255, 255, 255, 0.8); } h2 { font-size: 24px; font-weight: 800; color: var(--primary); margin-bottom: 6px; } .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 20px; } #reader { width: 100%; border-radius: 16px; overflow: hidden; border: 2px solid var(--border); background: #f8fafc; margin-bottom: 16px; } #reader video { border-radius: 14px; } #confirmar { display: none; margin-top: 16px; text-align: left; } .client-details { background: #f0f9ff; border: 1px solid rgba(14, 165, 233, 0.2); border-radius: 16px; padding: 16px; margin-bottom: 20px; } .client-details .nombre { font-size: 18px; font-weight: 700; color: #0369a1; margin-bottom: 4px; } .client-details .info { font-size: 13px; color: #0c4a6e; font-weight: 500; } .form-group { margin-bottom: 20px; } label { display: block; font-size: 14px; font-weight: 600; color: #334155; margin-bottom: 8px; } #cantidad { width: 100%; padding: 14px; font-size: 20px; font-weight: 700; text-align: center; border: 2px solid var(--border); border-radius: 14px; outline: none; background: #f8fafc; transition: all 0.2s ease; } #cantidad:focus { border-color: var(--primary); background: white; box-shadow: 0 0 0 4px var(--primary-light); } .btns { display: grid; grid-template-columns: 1fr 1.2fr; gap: 10px; margin-top: 20px; } button { padding: 14px; border: none; border-radius: 14px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; font-family: inherit; } .btn-confirmar { background: var(--primary); color: white; box-shadow: 0 4px 10px rgba(14, 165, 233, 0.2); } .btn-confirmar:hover { background: var(--primary-dark); transform: translateY(-2px); } .btn-cancelar { background: #f1f5f9; color: #475569; } .btn-cancelar:hover { background: #e2e8f0; color: #1e293b; } #resultado { margin-top: 16px; padding: 16px; border-radius: 16px; font-size: 15px; font-weight: 600; display: none; text-align: center; line-height: 1.4; } #resultado.ok { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; } #resultado.error { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; } #resultado.premio { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; font-weight: 700; } .volver { display: inline-block; margin-top: 24px; color: var(--primary); font-size: 14px; text-decoration: none; font-weight: 600; transition: color 0.2s ease; } .volver:hover { color: var(--primary-dark); }</style></head><body><div class="card"><h2>Escanear QR</h2><p class="subtitle" id="instruccion">Apuntá la cámara al código QR del cliente</p><div id="reader"></div><div id="confirmar"><div class="client-details"><div class="nombre" id="cliente-nombre"></div><div class="info" id="cliente-info"></div></div><div class="form-group"><label for="cantidad">¿Cuántas empanadas compró?</label><input type="number" id="cantidad" min="1" value="1"></div><div class="btns"><button class="btn-cancelar" id="btn-cancelar">Cancelar</button><button class="btn-confirmar" id="btn-confirmar">Sumar Sellos</button></div></div><div id="resultado"></div><a class="volver" href="/panel">← Volver al panel</a></div><script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script><script>
+  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Escanear Cliente | La Gauchada</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"><style>:root { --primary: #0ea5e9; --primary-dark: #0284c7; --primary-light: rgba(14, 165, 233, 0.15); --bg: #0f172a; --card-bg: #ffffff; --text: #0f172a; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --warning: #f59e0b; --danger: #ef4444; --shadow-lg: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1); } * { box-sizing: border-box; margin: 0; padding: 0; } body { font-family: 'Inter', -apple-system, sans-serif; background: radial-gradient(circle at top, #1e1b4b 0%, #0f172a 100%); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; } .card { background: var(--card-bg); border-radius: 24px; padding: 32px 24px; max-width: 440px; width: 100%; box-shadow: var(--shadow-lg); text-align: center; border: 1px solid rgba(255, 255, 255, 0.8); } h2 { font-size: 24px; font-weight: 800; color: var(--primary); margin-bottom: 6px; } .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 20px; } #reader { width: 100%; border-radius: 16px; overflow: hidden; border: 2px solid var(--border); background: #f8fafc; margin-bottom: 16px; } #reader video { border-radius: 14px; } #confirmar { display: none; margin-top: 16px; text-align: left; } .client-details { background: #f0f9ff; border: 1px solid rgba(14, 165, 233, 0.2); border-radius: 16px; padding: 16px; margin-bottom: 20px; } .client-details .nombre { font-size: 18px; font-weight: 700; color: #0369a1; margin-bottom: 4px; } .client-details .info { font-size: 13px; color: #0c4a6e; font-weight: 500; } .form-group { margin-bottom: 20px; } label { display: block; font-size: 14px; font-weight: 600; color: #334155; margin-bottom: 8px; } #cantidad { width: 100%; padding: 14px; font-size: 20px; font-weight: 700; text-align: center; border: 2px solid var(--border); border-radius: 14px; outline: none; background: #f8fafc; transition: all 0.2s ease; } #cantidad:focus { border-color: var(--primary); background: white; box-shadow: 0 0 0 4px var(--primary-light); } .btns { display: grid; grid-template-columns: 1fr 1.2fr; gap: 10px; margin-top: 20px; } button { padding: 14px; border: none; border-radius: 14px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; font-family: inherit; } .btn-confirmar { background: var(--primary); color: white; box-shadow: 0 4px 10px rgba(14, 165, 233, 0.2); } .btn-confirmar:hover { background: var(--primary-dark); transform: translateY(-2px); } .btn-cancelar { background: #f1f5f9; color: #475569; } .btn-cancelar:hover { background: #e2e8f0; color: #1e293b; } #resultado { margin-top: 16px; padding: 16px; border-radius: 16px; font-size: 15px; font-weight: 600; display: none; text-align: center; line-height: 1.4; } #resultado.ok { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; } #resultado.error { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; } #resultado.premio { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; font-weight: 700; }
+#resultado.warn { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; text-align: left; font-weight: 600; } .volver { display: inline-block; margin-top: 24px; color: var(--primary); font-size: 14px; text-decoration: none; font-weight: 600; transition: color 0.2s ease; } .volver:hover { color: var(--primary-dark); }</style></head><body><div class="card"><h2>Escanear QR</h2><p class="subtitle" id="instruccion">Apuntá la cámara al código QR del cliente</p><div id="reader"></div><div id="confirmar"><div class="client-details"><div class="nombre" id="cliente-nombre"></div><div class="info" id="cliente-info"></div></div><div class="form-group"><label for="cantidad">¿Cuántas empanadas compró?</label><input type="number" id="cantidad" min="1" value="1"></div><div class="btns"><button class="btn-cancelar" id="btn-cancelar">Cancelar</button><button class="btn-confirmar" id="btn-confirmar">Sumar Sellos</button></div></div><div id="resultado"></div><a class="volver" href="/panel">← Volver al panel</a></div><script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script><script>
     let escaneando=true,clienteId=null;
     const resultado=document.getElementById('resultado'),confirmar=document.getElementById('confirmar'),instruccion=document.getElementById('instruccion');
     const scanner=new Html5Qrcode('reader');
@@ -475,9 +498,10 @@ app.get('/escanear', requireAuth, (req, res) => {
         if(res.ok){
           if(data.disponibles>0){resultado.className='premio';resultado.innerHTML='🥟 ¡'+data.disponibles+' empanada'+(data.disponibles>1?'s':'')+' de regalo disponible'+(data.disponibles>1?'s':'')+' para '+data.nombre+'!';}
           else{resultado.className='ok';resultado.textContent='✓ '+cantidad+' sello(s) agregado(s) a '+data.nombre+' ('+data.progreso+'/10)';}
+          if(data.walletSync===false){resultado.className='warn';resultado.textContent+=' ⚠️ Los sellos se guardaron, pero la tarjeta de Wallet NO se actualizó. Revisá los registros del servidor.';}
         }else{resultado.className='error';resultado.textContent='✗ '+(data.error||'Error al agregar sellos');}
       }catch(e){resultado.className='error';resultado.textContent='✗ Error de conexión';}
-      setTimeout(iniciarScanner,3500);
+      setTimeout(iniciarScanner,resultado.className==='warn'?8000:3500);
     });
     iniciarScanner();
   </script></body></html>`);
@@ -498,8 +522,9 @@ app.post('/api/sello/:id', requireAuth, async (req, res) => {
   await agregarSellos(id, cantidad);
   const clienteActualizado = await obtenerCliente(id);
   const { progreso, disponibles } = calcularPremios(clienteActualizado);
-  try { await actualizarWallet(clienteActualizado); } catch (err) { console.error('Error wallet:', err.message); }
-  res.json({ nombre: cliente.nombre, progreso, disponibles });
+  let walletSync = true;
+  try { walletSync = await actualizarWallet(clienteActualizado); } catch (err) { walletSync = false; }
+  res.json({ nombre: cliente.nombre, progreso, disponibles, walletSync });
 });
 
 inicializarDB()
@@ -508,6 +533,7 @@ inicializarDB()
       console.log(`✅ Servidor corriendo en http://localhost:${process.env.PORT || 3000}`);
       console.log(`   Registro:  http://localhost:3000/registro`);
       console.log(`   Panel:     http://localhost:3000/panel`);
+      if (!PANEL_PASSWORD) console.warn('⚠️  PANEL_PASSWORD no está configurada: el acceso al panel y al escáner queda bloqueado.');
       console.log(`   QR:        http://localhost:3000/qr`);
     });
   })
