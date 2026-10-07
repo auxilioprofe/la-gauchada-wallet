@@ -25,14 +25,17 @@ function requireAuth(req, res, next) {
 }
 
 const ISSUER_ID = process.env.ISSUER_ID;
-// Normalizado: un espacio o un salto de línea de más en el panel de Render
-// rompía la comparación exacta del login sin ninguna pista de por qué.
+// Normalizado: un espacio o un salto de línea de más al pegarla en el panel del
+// proveedor rompía la comparación exacta del login sin ninguna pista de por qué.
 const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || '').trim();
 const CLASS_ID = process.env.CLASS_ID;
 
 // ── Base de datos Turso ────────────────────────────────────
+if (!process.env.TURSO_URL) {
+  console.warn('⚠️ TURSO_URL no está definida: usando archivo local gauchada.db (se pierde al reiniciar en Render). Configurá TURSO_URL y TURSO_TOKEN.');
+}
 const db = createClient({
-  url: process.env.TURSO_URL,
+  url: process.env.TURSO_URL || 'file:gauchada.db',
   authToken: process.env.TURSO_TOKEN,
 });
 
@@ -98,8 +101,28 @@ async function obtenerTodosLosClientes() {
   return result.rows;
 }
 
-const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-const auth = new GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/wallet_object.issuer'] });
+let credentials = null;
+try {
+  if (process.env.GOOGLE_CREDENTIALS) {
+    credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  } else {
+    const fs = require('fs');
+    const path = require('path');
+    const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || './service-account.json';
+    const resolvedPath = path.resolve(credPath);
+    if (fs.existsSync(resolvedPath)) {
+      credentials = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+    } else {
+      console.warn("⚠️ Advertencia: No se encontró la variable de entorno GOOGLE_CREDENTIALS ni el archivo service-account.json. Las funciones de Google Wallet estarán desactivadas.");
+    }
+  }
+} catch (e) {
+  console.error("❌ Error al cargar credenciales de Google:", e.message);
+}
+
+const auth = credentials
+  ? new GoogleAuth({ credentials, scopes: ['https://www.googleapis.com/auth/wallet_object.issuer'] })
+  : null;
 
 function walletBody(cliente) {
   const { disponibles, enEspera, progreso } = calcularPremios(cliente);
@@ -112,6 +135,10 @@ function walletBody(cliente) {
 }
 
 async function generarWalletLink(cliente) {
+  if (!auth || !credentials) {
+    console.warn("⚠️ Google Wallet no está configurado. Retornando enlace de simulación.");
+    return `#/simulado-wallet-link?id=${cliente.id}`;
+  }
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
   const { progreso } = calcularPremios(cliente);
   const client = await auth.getClient();
@@ -130,7 +157,13 @@ async function generarWalletLink(cliente) {
   return `https://pay.google.com/gp/v/save/${token}`;
 }
 
+// Devuelve true si la tarjeta quedó actualizada, false si Google Wallet no está
+// configurado. Si el envío falla, relanza para que quien llama pueda avisarlo.
 async function actualizarWallet(cliente) {
+  if (!auth || !credentials) {
+    console.warn("⚠️ Google Wallet no está configurado. No se pudo actualizar el wallet del cliente: " + cliente.id);
+    return false;
+  }
   const client = await auth.getClient();
   const objectId = `${ISSUER_ID}.cliente_${cliente.id}`;
   const { progreso } = calcularPremios(cliente);
@@ -151,16 +184,182 @@ async function actualizarWallet(cliente) {
     console.error(`Error wallet: PATCH ${objectId} falló (HTTP ${status || '?'}): ${detalle}`);
     throw err;
   }
+  return true;
 }
 
 // ── RUTAS ──────────────────────────────────────────────────
 
+const UI = {
+  head: (title) => `
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${title} | La Gauchada</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --primary: #0ea5e9;
+        --primary-dark: #0284c7;
+        --primary-light: rgba(14, 165, 233, 0.15);
+        --bg: #0f172a;
+        --card-bg: #ffffff;
+        --text: #0f172a;
+        --text-muted: #64748b;
+        --border: #e2e8f0;
+        --success: #10b981;
+        --warning: #f59e0b;
+        --danger: #ef4444;
+        --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+        --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        --shadow-lg: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+        --shadow-xl: 0 25px 50px -12px rgb(0 0 0 / 0.25);
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: 'Inter', -apple-system, sans-serif;
+        background: radial-gradient(circle at top, #1e1b4b 0%, #0f172a 100%);
+        color: var(--text);
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+      }
+      .card {
+        background: var(--card-bg);
+        border-radius: 24px;
+        padding: 40px 32px;
+        max-width: 440px;
+        width: 100%;
+        box-shadow: var(--shadow-xl);
+        text-align: center;
+        border: 1px solid rgba(255, 255, 255, 0.8);
+        position: relative;
+        overflow: hidden;
+      }
+      .card::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 6px;
+        background: linear-gradient(90deg, var(--primary) 0%, var(--success) 100%);
+      }
+      .logo {
+        font-size: 28px;
+        font-weight: 800;
+        color: var(--primary);
+        letter-spacing: -0.5px;
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+      }
+      .logo span {
+        background: linear-gradient(to right, #0ea5e9, #10b981);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+      }
+      .subtitle {
+        color: var(--text-muted);
+        font-size: 15px;
+        margin-bottom: 32px;
+        font-weight: 500;
+      }
+      .form-group {
+        text-align: left;
+        margin-bottom: 20px;
+      }
+      label {
+        display: block;
+        font-size: 14px;
+        font-weight: 600;
+        color: #334155;
+        margin-bottom: 8px;
+      }
+      input {
+        width: 100%;
+        padding: 14px 18px;
+        border: 2px solid var(--border);
+        border-radius: 16px;
+        font-size: 16px;
+        outline: none;
+        font-family: inherit;
+        transition: all 0.2s ease;
+        background: #f8fafc;
+      }
+      input:focus {
+        border-color: var(--primary);
+        background: #ffffff;
+        box-shadow: 0 0 0 4px var(--primary-light);
+      }
+      button, .btn {
+        width: 100%;
+        padding: 16px;
+        background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+        color: white;
+        border: none;
+        border-radius: 16px;
+        font-size: 16px;
+        font-weight: 600;
+        cursor: pointer;
+        font-family: inherit;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        text-decoration: none;
+        transition: all 0.2s ease;
+        box-shadow: 0 4px 12px rgba(14, 165, 233, 0.25);
+      }
+      button:hover, .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 12px 20px rgba(14, 165, 233, 0.4);
+      }
+      button:active, .btn:active {
+        transform: translateY(0);
+      }
+      .btn-secondary {
+        background: #f1f5f9;
+        color: #475569;
+        box-shadow: none;
+      }
+      .btn-secondary:hover {
+        background: #e2e8f0;
+        color: #1e293b;
+        box-shadow: none;
+      }
+      .error {
+        background: #fef2f2;
+        color: var(--danger);
+        border: 1px solid #fee2e2;
+        padding: 14px;
+        border-radius: 16px;
+        font-size: 14px;
+        margin-bottom: 20px;
+        font-weight: 500;
+        text-align: center;
+      }
+    </style>
+  `
+};
+
 app.get('/login', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Acceso Panel</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:32px 24px;max-width:360px;width:100%;text-align:center}.logo{font-size:24px;font-weight:800;color:#00ADEF;margin-bottom:4px}.subtitle{color:#666;font-size:14px;margin-bottom:28px}input{width:100%;padding:14px 16px;border:2px solid #e0e0e0;border-radius:12px;font-size:16px;margin-bottom:12px;outline:none}input:focus{border-color:#00ADEF}button{width:100%;padding:16px;background:#00ADEF;color:white;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer}.error{color:#e53e3e;font-size:14px;margin-bottom:12px}</style></head><body><div class="card"><div class="logo">LA GAUCHADA</div><div class="subtitle">Acceso al panel</div>${req.query.error === '2' ? '<div class="error">El servidor no tiene PANEL_PASSWORD configurada. Cargala en las variables de entorno y reintentá.</div>' : req.query.error ? '<div class="error">Contraseña incorrecta</div>' : ''}<form action="/login" method="POST"><input type="password" name="password" placeholder="Contraseña" required autofocus><button type="submit">Entrar →</button></form></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('Acceso Panel')}</head><body><div class="card"><div class="logo"><span>LA GAUCHADA</span> 🥟</div><div class="subtitle">Acceso seguro al panel</div>${req.query.error === '2' ? '<div class="error">⚙️ El servidor no tiene PANEL_PASSWORD configurada. Cargala en las variables de entorno y reintentá.</div>' : req.query.error ? '<div class="error">🔑 Contraseña incorrecta</div>' : ''}<form action="/login" method="POST"><div class="form-group"><label>Contraseña administrativa</label><input type="password" name="password" placeholder="••••••••" required autofocus></div><button type="submit">Entrar al panel →</button></form></div></body></html>`);
 });
 
 app.post('/login', (req, res) => {
-  // Sin contraseña configurada el panel queda cerrado, nunca abierto.
+  // Sin contraseña configurada el panel queda cerrado, nunca abierto con una
+  // contraseña de respaldo fija: la URL es pública y desde el panel se otorgan
+  // sellos y se canjean premios.
   if (!PANEL_PASSWORD) return res.redirect('/login?error=2');
   const ingresada = (req.body.password || '').trim();
   if (ingresada && ingresada === PANEL_PASSWORD) { req.session.autenticado = true; res.redirect('/panel'); }
@@ -170,7 +369,7 @@ app.post('/login', (req, res) => {
 app.get('/logout', (req, res) => { req.session = null; res.redirect('/login'); });
 
 app.get('/registro', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Club La Gauchada</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:32px 24px;max-width:400px;width:100%;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,0.15)}.logo{font-size:28px;font-weight:800;color:#00ADEF;margin-bottom:4px;letter-spacing:-0.5px}.subtitle{color:#666;font-size:15px;margin-bottom:28px}.promo{background:#f0f9ff;border-radius:12px;padding:16px;margin-bottom:24px}.promo p{color:#00ADEF;font-weight:600;font-size:15px}input{width:100%;padding:14px 16px;border:2px solid #e0e0e0;border-radius:12px;font-size:16px;margin-bottom:12px;outline:none}input:focus{border-color:#00ADEF}button{width:100%;padding:16px;background:#00ADEF;color:white;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer}.footer{margin-top:20px;font-size:13px;color:#999}</style></head><body><div class="card"><div class="logo">LA GAUCHADA</div><div class="subtitle">Club de Lealtad</div><div class="promo"><p>🥟 Acumulá 10 sellos y ganás una empanada gratis</p></div><form action="/registro" method="POST"><input type="text" name="nombre" placeholder="Tu nombre" required maxlength="100"><input type="tel" name="telefono" placeholder="Tu teléfono (opcional)" maxlength="20"><button type="submit">Unirme al club →</button></form><div class="footer">Tu tarjeta se agrega directo a Google Wallet</div></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('Club de Lealtad')}<style>.promo { background: linear-gradient(135deg, #e0f2fe 0%, #f0f9ff 100%); border: 1px solid rgba(14, 165, 233, 0.2); border-radius: 18px; padding: 20px; margin-bottom: 28px; text-align: left; display: flex; gap: 12px; align-items: flex-start; } .promo-icon { font-size: 24px; } .promo-text h4 { font-weight: 700; color: #0369a1; margin-bottom: 4px; } .promo-text p { font-size: 13px; color: #0e7490; line-height: 1.4; } .footer-text { margin-top: 24px; font-size: 12px; color: var(--text-muted); font-weight: 500; }</style></head><body><div class="card"><div class="logo"><span>LA GAUCHADA</span> 🥟</div><div class="subtitle">Club de Lealtad</div><div class="promo"><div class="promo-icon">🎁</div><div class="promo-text"><h4>¡Empanada de Regalo!</h4><p>Acumulá 10 sellos en tus compras y obtené una empanada completamente gratis.</p></div></div><form action="/registro" method="POST"><div class="form-group"><label>Nombre completo</label><input type="text" name="nombre" placeholder="Ej. Juan Pérez" required maxlength="100"></div><div class="form-group"><label>Teléfono <span style="font-weight: normal; color: var(--text-muted);">(opcional)</span></label><input type="tel" name="telefono" placeholder="Ej. +54 9 11 1234 5678" maxlength="20"></div><button type="submit">Registrarme gratis →</button></form><div class="footer-text">Tu tarjeta de fidelidad se añade a tu celular</div></div></body></html>`);
 });
 
 app.post('/registro', async (req, res) => {
@@ -182,7 +381,7 @@ app.post('/registro', async (req, res) => {
     await crearCliente({ id, nombre, telefono });
     const clienteCompleto = { id, nombre, telefono, sellos_totales: 0, empanadas_canjeadas: 0 };
     const walletLink = await generarWalletLink(clienteCompleto);
-    res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>¡Bienvenido!</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:32px 24px;max-width:400px;width:100%;text-align:center}h1{font-size:24px;color:#333;margin-bottom:8px}p{color:#666;margin-bottom:24px;font-size:15px}.wallet-btn{display:block;background:#000;color:white;padding:16px;border-radius:12px;text-decoration:none;font-size:17px;font-weight:600;margin-bottom:12px}.id{background:#f5f5f5;border-radius:8px;padding:12px;font-size:13px;color:#999}</style></head><body><div class="card"><h1>¡Bienvenido, ${nombre}! 🎉</h1><p>Tu tarjeta de sellos está lista. Agregala a Google Wallet con un toque.</p><a class="wallet-btn" href="${walletLink}">+ Agregar a Google Wallet</a><div class="id">Tu número de cliente: #${id}</div></div></body></html>`);
+    res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('¡Bienvenido!')}<style>.welcome-icon { font-size: 48px; margin-bottom: 16px; animation: bounce 2s infinite; } @keyframes bounce { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-10px); } } h1 { font-size: 24px; color: #0f172a; margin-bottom: 8px; font-weight: 800; } p { color: var(--text-muted); margin-bottom: 32px; font-size: 15px; line-height: 1.5; } .wallet-btn { display: inline-flex; background: #000000; color: #ffffff; padding: 0 24px; height: 56px; align-items: center; border-radius: 28px; text-decoration: none; font-weight: 600; font-size: 15px; box-shadow: var(--shadow-md); transition: all 0.2s ease; border: 1px solid #333333; margin-bottom: 24px; } .wallet-btn:hover { background: #111111; transform: translateY(-2px); box-shadow: 0 8px 16px rgba(0,0,0,0.3); } .wallet-btn svg { margin-right: 12px; } .id-badge { background: #f8fafc; border: 1px dashed var(--border); border-radius: 12px; padding: 12px; font-size: 13px; color: var(--text-muted); font-family: monospace; font-weight: 600; }</style></head><body><div class="card"><div class="welcome-icon">🎉</div><h1>¡Bienvenido, ${nombre}!</h1><p>Tu cuenta del Club La Gauchada ha sido creada. Agregá tu tarjeta digital para acumular sellos.</p><a class="wallet-btn" href="${walletLink}"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M19 4H5C3.89 4 3.01 4.89 3.01 6L3 18C3 19.11 3.89 20 5 20H19C20.11 20 21 19.11 21 18V6C21 4.89 20.11 4 19 4ZM19 18H5V12H19V18ZM19 8H5V6H19V8Z" fill="#FFFFFF"/><path d="M12 14.5C12.83 14.5 13.5 13.83 13.5 13C13.5 12.17 12.83 11.5 12 11.5C11.17 11.5 10.5 12.17 10.5 13C10.5 13.83 11.17 14.5 12 14.5Z" fill="#0EA5E9"/></svg>Añadir a Google Wallet</a><div class="id-badge">ID de Cliente: #${id}</div></div></body></html>`);
   } catch (err) { console.error(err); res.status(500).send('Error al crear la tarjeta. Intentá de nuevo.'); }
 });
 
@@ -191,22 +390,41 @@ app.get('/panel', requireAuth, async (req, res) => {
   const lista = clientes.map(c => {
     const { progreso, disponibles, pendientes } = calcularPremios(c);
     return `<tr>
-      <td>#${c.id}</td><td>${c.nombre}</td><td>${c.telefono || '-'}</td>
-      <td><strong>${progreso}/10</strong>${disponibles > 0 ? ` <span style="color:#22c55e">🥟×${disponibles}</span>` : ''}${pendientes > 3 ? ` <span style="color:#f59e0b;font-size:12px">(+${pendientes-3} espera)</span>` : ''}</td>
+      <td><span class="client-id">#${c.id}</span></td>
+      <td><span class="client-name">${c.nombre}</span></td>
+      <td><span class="client-tel">${c.telefono || '-'}</span></td>
       <td>
-        ${disponibles > 0 ? `<form action="/canjear" method="POST" style="display:inline"><input type="hidden" name="id" value="${c.id}"><button type="submit" style="background:#22c55e">🎁 Canjear</button></form>` : ''}
-        <a href="/editar/${c.id}" style="display:inline-block;padding:8px 12px;background:#f5f5f5;color:#333;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;margin:0 4px">✏️</a>
-        <form action="/eliminar/${c.id}" method="POST" style="display:inline" onsubmit="return confirm('¿Eliminar a ${c.nombre}?')"><button type="submit" style="background:#ef4444">🗑️</button></form>
-      </td></tr>`;
+        <div class="stamps-badge ${disponibles > 0 ? 'completed' : ''}">
+          <span>Sellos:</span>
+          <strong>${progreso}/10</strong>
+        </div>
+        ${disponibles > 0 ? `<span class="reward-pill">🎁 ${disponibles} Canje${disponibles > 1 ? 's' : ''}</span>` : ''}
+        ${pendientes > 3 ? `<span class="reward-pill" style="background:#fef3c7;color:#d97706;">(+${pendientes - 3} en espera)</span>` : ''}
+      </td>
+      <td>
+        <div class="actions">
+          ${disponibles > 0 ? `
+            <form action="/canjear" method="POST" style="margin:0">
+              <input type="hidden" name="id" value="${c.id}">
+              <button type="submit" class="action-btn action-btn-claim">🎁 Canjear</button>
+            </form>
+          ` : ''}
+          <a href="/editar/${c.id}" class="action-btn action-btn-edit">✏️ Editar</a>
+          <form action="/eliminar/${c.id}" method="POST" style="margin:0" onsubmit="return confirm('¿Seguro que querés eliminar a ${c.nombre}?')">
+            <button type="submit" class="action-btn action-btn-delete">🗑️</button>
+          </form>
+        </div>
+      </td>
+    </tr>`;
   }).join('');
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Panel La Gauchada</title><link rel="manifest" href="/manifest.json"><meta name="theme-color" content="#00ADEF"><meta name="mobile-web-app-capable" content="yes"><style>body{font-family:-apple-system,sans-serif;padding:24px;background:#f5f5f5}h1{color:#00ADEF;margin-bottom:16px}.nav{margin-bottom:16px}.nav a{display:inline-block;padding:10px 18px;background:#00ADEF;color:white;border-radius:10px;text-decoration:none;font-size:14px;font-weight:600;margin-right:8px}table{width:100%;background:white;border-radius:12px;border-collapse:collapse;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.08)}th{background:#00ADEF;color:white;padding:12px 16px;text-align:left;font-size:14px}td{padding:12px 16px;border-bottom:1px solid #f0f0f0;font-size:14px}button{padding:8px 12px;background:#00ADEF;color:white;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;margin-right:4px}.empty{text-align:center;padding:40px;color:#999}</style></head><body><h1>Panel La Gauchada 🥟</h1><div class="nav"><a href="/escanear">📷 Escanear</a><a href="/logout" style="background:#666">Salir</a></div><table><thead><tr><th>#</th><th>Nombre</th><th>Teléfono</th><th>Sellos/Premios</th><th>Acciones</th></tr></thead><tbody>${lista || '<tr><td colspan="5" class="empty">No hay clientes registrados aún</td></tr>'}</tbody></table></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Panel de Administración | La Gauchada</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"><style>:root { --primary: #0ea5e9; --primary-dark: #0284c7; --bg: #f8fafc; --card-bg: #ffffff; --text: #0f172a; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --warning: #f59e0b; --danger: #ef4444; } * { box-sizing: border-box; margin: 0; padding: 0; } body { font-family: 'Inter', -apple-system, sans-serif; background: #f1f5f9; color: var(--text); min-height: 100vh; padding: 40px 20px; } .container { max-width: 1000px; margin: 0 auto; } header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 32px; } h1 { font-size: 28px; font-weight: 800; display: flex; align-items: center; gap: 10px; } h1 span { background: linear-gradient(to right, #0ea5e9, #10b981); -webkit-background-clip: text; -webkit-text-fill-color: transparent; } .nav { display: flex; gap: 12px; } .nav a { padding: 12px 20px; border-radius: 12px; text-decoration: none; font-size: 14px; font-weight: 600; transition: all 0.2s ease; display: inline-flex; align-items: center; gap: 8px; } .btn-primary { background: var(--primary); color: white; box-shadow: 0 4px 12px rgba(14, 165, 233, 0.2); } .btn-primary:hover { background: var(--primary-dark); transform: translateY(-2px); box-shadow: 0 8px 16px rgba(14, 165, 233, 0.3); } .btn-secondary { background: white; color: var(--text-muted); border: 1px solid var(--border); } .btn-secondary:hover { background: #f8fafc; color: var(--text); transform: translateY(-2px); } .table-container { background: white; border-radius: 20px; box-shadow: 0 10px 30px -5px rgba(0,0,0,0.05); border: 1px solid var(--border); overflow: hidden; } table { width: 100%; border-collapse: collapse; text-align: left; } th { background: #f8fafc; color: var(--text-muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; padding: 16px 24px; border-bottom: 1px solid var(--border); } td { padding: 18px 24px; border-bottom: 1px solid var(--border); font-size: 15px; } tr:last-child td { border-bottom: none; } .client-id { font-family: monospace; background: #f1f5f9; padding: 4px 8px; border-radius: 6px; font-weight: 600; color: var(--text-muted); } .client-name { font-weight: 600; color: #1e293b; } .client-tel { color: var(--text-muted); } .stamps-badge { display: inline-flex; align-items: center; background: #f0f9ff; color: #0369a1; padding: 6px 12px; border-radius: 9999px; font-size: 14px; font-weight: 700; gap: 6px; border: 1px solid #e0f2fe; } .stamps-badge.completed { background: #ecfdf5; color: #047857; border-color: #d1fae5; } .reward-pill { background: #fef3c7; color: #d97706; padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 700; margin-left: 8px; border: 1px solid #fde68a; } .actions { display: flex; gap: 8px; align-items: center; } .action-btn { padding: 8px 12px; border-radius: 8px; border: none; cursor: pointer; font-weight: 600; font-size: 13px; transition: all 0.2s ease; display: inline-flex; align-items: center; gap: 4px; text-decoration: none; } .action-btn-claim { background: var(--success); color: white; } .action-btn-claim:hover { background: #059669; transform: scale(1.05); } .action-btn-edit { background: #f1f5f9; color: #475569; } .action-btn-edit:hover { background: #e2e8f0; color: #1e293b; } .action-btn-delete { background: #fff5f5; color: var(--danger); } .action-btn-delete:hover { background: var(--danger); color: white; } .empty-state { text-align: center; padding: 60px 40px; color: var(--text-muted); } .empty-state-icon { font-size: 48px; margin-bottom: 16px; }</style></head><body><div class="container"><header><h1><span>Panel La Gauchada</span> 🥟</h1><div class="nav"><a href="/escanear" class="btn-primary">📷 Escanear QR</a><a href="/qr" target="_blank" class="btn-secondary">🔗 Mostrar QR</a><a href="/logout" class="btn-secondary" style="color:var(--danger)">Salir</a></div></header><div class="table-container"><table><thead><tr><th>ID</th><th>Nombre</th><th>Teléfono</th><th>Progreso / Premios</th><th>Acciones</th></tr></thead><tbody>${lista || '<tr><td colspan="5"><div class="empty-state"><div class="empty-state-icon">👥</div><h3>No hay clientes registrados</h3><p style="margin-top:8px;font-size:14px;">Los clientes aparecerán aquí una vez que se unan al Club.</p></div></td></tr>'}</tbody></table></div></div></body></html>`);
 });
 
 app.get('/editar/:id', requireAuth, async (req, res) => {
   const cliente = await obtenerCliente(req.params.id);
   if (!cliente) return res.status(404).send('Cliente no encontrado');
   const { progreso, disponibles } = calcularPremios(cliente);
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Editar Cliente</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:32px 24px;max-width:400px;width:100%}h2{color:#00ADEF;margin-bottom:20px;text-align:center}label{display:block;font-size:13px;color:#666;margin-bottom:4px;margin-top:14px}input{width:100%;padding:12px 16px;border:2px solid #e0e0e0;border-radius:12px;font-size:16px;outline:none}input:focus{border-color:#00ADEF}.info{background:#f0f9ff;border-radius:10px;padding:12px;margin:16px 0;font-size:13px;color:#555}.btns{display:flex;gap:10px;margin-top:20px}.btn-save{flex:1;padding:14px;background:#00ADEF;color:white;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer}.btn-back{flex:1;padding:14px;background:#f5f5f5;color:#666;border:none;border-radius:12px;font-size:16px;text-decoration:none;text-align:center}</style></head><body><div class="card"><h2>Editar #${cliente.id}</h2><form action="/editar/${cliente.id}" method="POST"><label>Nombre</label><input type="text" name="nombre" value="${cliente.nombre}" required maxlength="100"><label>Teléfono</label><input type="tel" name="telefono" value="${cliente.telefono || ''}" maxlength="20"><div class="info">Sellos totales: ${cliente.sellos_totales || 0} · Progreso: ${progreso}/10 · Empanadas disponibles: ${disponibles}</div><label>Corregir sellos totales</label><input type="number" name="sellos_totales" value="${cliente.sellos_totales || 0}" min="0"><label>Empanadas ya canjeadas</label><input type="number" name="empanadas_canjeadas" value="${cliente.empanadas_canjeadas || 0}" min="0"><div class="btns"><a class="btn-back" href="/panel">Cancelar</a><button class="btn-save" type="submit">Guardar</button></div></form></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('Editar Cliente')}<style>.info-box { background: #f0f9ff; border: 1px solid rgba(14, 165, 233, 0.2); border-radius: 16px; padding: 16px; margin: 20px 0; text-align: left; font-size: 14px; line-height: 1.5; } .info-box h4 { color: #0369a1; font-weight: 700; margin-bottom: 4px; } .info-box p { color: #0e7490; } .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; } .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 28px; }</style></head><body><div class="card"><div class="logo"><span>LA GAUCHADA</span></div><div class="subtitle">Editar Cliente #${cliente.id}</div><form action="/editar/${cliente.id}" method="POST"><div class="form-group"><label>Nombre del cliente</label><input type="text" name="nombre" value="${cliente.nombre}" required maxlength="100"></div><div class="form-group"><label>Teléfono</label><input type="tel" name="telefono" value="${cliente.telefono || ''}" maxlength="20"></div><div class="info-box"><h4>Resumen de Puntos</h4><p>Sellos totales acumulados: <strong>${cliente.sellos_totales || 0}</strong></p><p>Progreso actual: <strong>${progreso}/10</strong></p><p>Empanadas disponibles: <strong>${disponibles}</strong></p></div><div class="form-row"><div class="form-group"><label>Sellos Totales</label><input type="number" name="sellos_totales" value="${cliente.sellos_totales || 0}" min="0"></div><div class="form-group"><label>Canjeadas</label><input type="number" name="empanadas_canjeadas" value="${cliente.empanadas_canjeadas || 0}" min="0"></div></div><div class="btns"><a class="btn btn-secondary" href="/panel">Cancelar</a><button type="submit">Guardar</button></div></form></div></body></html>`);
 });
 
 app.post('/editar/:id', requireAuth, async (req, res) => {
@@ -236,24 +454,25 @@ app.post('/canjear', requireAuth, async (req, res) => {
   const clienteActualizado = await obtenerCliente(id);
   try { await actualizarWallet(clienteActualizado); } catch (err) { /* ya logueado en actualizarWallet */ }
   const restantes = pendientes - 1;
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Canje exitoso</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:32px 24px;max-width:400px;width:100%;text-align:center}h1{font-size:24px;color:#22c55e;margin-bottom:12px}p{color:#555;font-size:15px;margin-bottom:8px}.restante{background:#f0f9ff;border-radius:12px;padding:14px;margin:20px 0;color:#00ADEF;font-weight:600;font-size:15px}a{display:block;padding:14px;background:#00ADEF;color:white;border-radius:12px;text-decoration:none;font-size:16px;font-weight:600}</style></head><body><div class="card"><h1>🥟 ¡Canje exitoso!</h1><p><strong>${cliente.nombre}</strong> canjeó una empanada gratis.</p><div class="restante">${restantes > 0 ? `Le quedan ${restantes} empanada${restantes > 1 ? 's' : ''} por canjear` : 'No quedan empanadas pendientes'}</div><a href="/panel">← Volver al panel</a></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('Canje Exitoso')}<style>.success-icon { font-size: 56px; margin-bottom: 20px; } h1 { font-size: 26px; color: var(--success); margin-bottom: 12px; font-weight: 800; } .client-details { background: #f8fafc; border: 1px solid var(--border); border-radius: 16px; padding: 16px; margin: 24px 0; font-size: 15px; } .pill { display: inline-block; padding: 8px 16px; border-radius: 9999px; background: var(--primary-light); color: var(--primary-dark); font-weight: 700; margin-top: 12px; font-size: 14px; }</style></head><body><div class="card"><div class="success-icon">🥟🎉</div><h1>¡Canje Exitoso!</h1><p>Se ha procesado correctamente la entrega del premio.</p><div class="client-details"><p>Cliente: <strong>${cliente.nombre}</strong></p><div class="pill">${restantes > 0 ? `Le quedan ${restantes} empanada${restantes > 1 ? 's' : ''} gratis` : 'No quedan premios pendientes'}</div></div><a class="btn" href="/panel">← Volver al panel</a></div></body></html>`);
 });
 
 app.get('/qr', async (req, res) => {
   const url = `${req.protocol}://${req.get('host')}/registro`;
   const qr = await QRCode.toDataURL(url, { width: 400, margin: 2 });
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>QR La Gauchada</title><style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:white}.wrap{text-align:center;padding:40px;border:3px solid #00ADEF;border-radius:20px;max-width:350px}h2{color:#00ADEF;font-size:22px;margin-bottom:4px}p{color:#666;font-size:14px;margin-bottom:20px}img{width:250px;height:250px}.inst{margin-top:16px;font-size:13px;color:#999}</style></head><body><div class="wrap"><h2>LA GAUCHADA</h2><p>Escaneá para unirte al club de lealtad</p><img src="${qr}" alt="QR"><div class="inst">📱 Abrí la cámara y apuntá acá</div></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="es"><head>${UI.head('QR Registro')}<style>.qr-container { background: white; border-radius: 20px; padding: 24px; box-shadow: var(--shadow-md); margin: 24px 0; display: inline-block; border: 1px solid var(--border); } img { max-width: 100%; height: auto; display: block; } .instructions { font-size: 14px; color: var(--text-muted); font-weight: 500; }</style></head><body><div class="card"><div class="logo"><span>LA GAUCHADA</span> 🥟</div><div class="subtitle">Club de Lealtad</div><p style="font-size: 15px; font-weight: 500;">Escaneá el código QR con tu celular para registrarte y obtener premios.</p><div class="qr-container"><img src="${qr}" alt="Código QR de registro"></div><div class="instructions">📱 Abrí la cámara de tu celular y enfocá aquí</div></div></body></html>`);
 });
 
 app.get('/escanear', requireAuth, (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Escanear Cliente</title> <link rel="manifest" href="/manifest.json"> <meta name="theme-color" content="#00ADEF"> <meta name="mobile-web-app-capable" content="yes"><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:24px;max-width:400px;width:100%;text-align:center}h2{color:#00ADEF;font-size:20px;margin-bottom:6px}p{color:#666;font-size:14px;margin-bottom:20px}#reader{width:100%;border-radius:12px;overflow:hidden}#confirmar{display:none;margin-top:16px}#confirmar .nombre{font-size:18px;font-weight:600;color:#333;margin-bottom:4px}#confirmar .info{font-size:13px;color:#999;margin-bottom:16px}#confirmar label{font-size:14px;color:#555;display:block;margin-bottom:8px}#cantidad{width:80px;padding:10px;font-size:24px;text-align:center;border:2px solid #e0e0e0;border-radius:12px;outline:none}#cantidad:focus{border-color:#00ADEF}.btns{display:flex;gap:10px;margin-top:16px}.btn-confirmar{flex:1;padding:14px;background:#00ADEF;color:white;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer}.btn-cancelar{flex:1;padding:14px;background:#f5f5f5;color:#666;border:none;border-radius:12px;font-size:16px;cursor:pointer}#resultado{margin-top:16px;padding:14px;border-radius:12px;font-size:15px;display:none}#resultado.ok{background:#dcfce7;color:#166534}#resultado.error{background:#fee2e2;color:#991b1b}#resultado.premio{background:#fef3c7;color:#92400e;font-weight:600}#resultado.warn{background:#fef3c7;color:#92400e;text-align:left}.volver{display:block;margin-top:16px;color:#00ADEF;font-size:14px;text-decoration:none}</style></head><body><div class="card"><h2>Escanear cliente</h2><p id="instruccion">Apuntá la cámara al QR del cliente</p><div id="reader"></div><div id="confirmar"><div class="nombre" id="cliente-nombre"></div><div class="info" id="cliente-info"></div><label>¿Cuántas empanadas compró?</label><input type="number" id="cantidad" min="1" value="1"><div class="btns"><button class="btn-cancelar" id="btn-cancelar">Cancelar</button><button class="btn-confirmar" id="btn-confirmar">Agregar sellos</button></div></div><div id="resultado"></div><a class="volver" href="/panel">← Volver al panel</a></div><script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script><script>
+  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Escanear Cliente | La Gauchada</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"><style>:root { --primary: #0ea5e9; --primary-dark: #0284c7; --primary-light: rgba(14, 165, 233, 0.15); --bg: #0f172a; --card-bg: #ffffff; --text: #0f172a; --text-muted: #64748b; --border: #e2e8f0; --success: #10b981; --warning: #f59e0b; --danger: #ef4444; --shadow-lg: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1); } * { box-sizing: border-box; margin: 0; padding: 0; } body { font-family: 'Inter', -apple-system, sans-serif; background: radial-gradient(circle at top, #1e1b4b 0%, #0f172a 100%); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; } .card { background: var(--card-bg); border-radius: 24px; padding: 32px 24px; max-width: 440px; width: 100%; box-shadow: var(--shadow-lg); text-align: center; border: 1px solid rgba(255, 255, 255, 0.8); } h2 { font-size: 24px; font-weight: 800; color: var(--primary); margin-bottom: 6px; } .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 20px; } #reader { width: 100%; border-radius: 16px; overflow: hidden; border: 2px solid var(--border); background: #f8fafc; margin-bottom: 16px; } #reader video { border-radius: 14px; } #confirmar { display: none; margin-top: 16px; text-align: left; } .client-details { background: #f0f9ff; border: 1px solid rgba(14, 165, 233, 0.2); border-radius: 16px; padding: 16px; margin-bottom: 20px; } .client-details .nombre { font-size: 18px; font-weight: 700; color: #0369a1; margin-bottom: 4px; } .client-details .info { font-size: 13px; color: #0c4a6e; font-weight: 500; } .form-group { margin-bottom: 20px; } label { display: block; font-size: 14px; font-weight: 600; color: #334155; margin-bottom: 8px; } #cantidad { width: 100%; padding: 14px; font-size: 20px; font-weight: 700; text-align: center; border: 2px solid var(--border); border-radius: 14px; outline: none; background: #f8fafc; transition: all 0.2s ease; } #cantidad:focus { border-color: var(--primary); background: white; box-shadow: 0 0 0 4px var(--primary-light); } .btns { display: grid; grid-template-columns: 1fr 1.2fr; gap: 10px; margin-top: 20px; } button { padding: 14px; border: none; border-radius: 14px; font-size: 15px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; font-family: inherit; } .btn-confirmar { background: var(--primary); color: white; box-shadow: 0 4px 10px rgba(14, 165, 233, 0.2); } .btn-confirmar:hover { background: var(--primary-dark); transform: translateY(-2px); } .btn-cancelar { background: #f1f5f9; color: #475569; } .btn-cancelar:hover { background: #e2e8f0; color: #1e293b; } #resultado { margin-top: 16px; padding: 16px; border-radius: 16px; font-size: 15px; font-weight: 600; display: none; text-align: center; line-height: 1.4; } #resultado.ok { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; } #resultado.error { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; } #resultado.premio { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; font-weight: 700; }
+#resultado.warn { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; text-align: left; font-weight: 600; } .volver { display: inline-block; margin-top: 24px; color: var(--primary); font-size: 14px; text-decoration: none; font-weight: 600; transition: color 0.2s ease; } .volver:hover { color: var(--primary-dark); }</style></head><body><div class="card"><h2>Escanear QR</h2><p class="subtitle" id="instruccion">Apuntá la cámara al código QR del cliente</p><div id="reader"></div><div id="confirmar"><div class="client-details"><div class="nombre" id="cliente-nombre"></div><div class="info" id="cliente-info"></div></div><div class="form-group"><label for="cantidad">¿Cuántas empanadas compró?</label><input type="number" id="cantidad" min="1" value="1"></div><div class="btns"><button class="btn-cancelar" id="btn-cancelar">Cancelar</button><button class="btn-confirmar" id="btn-confirmar">Sumar Sellos</button></div></div><div id="resultado"></div><a class="volver" href="/panel">← Volver al panel</a></div><script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script><script>
     let escaneando=true,clienteId=null;
     const resultado=document.getElementById('resultado'),confirmar=document.getElementById('confirmar'),instruccion=document.getElementById('instruccion');
     const scanner=new Html5Qrcode('reader');
     function iniciarScanner(){
       escaneando=true;clienteId=null;
       confirmar.style.display='none';resultado.style.display='none';
-      instruccion.textContent='Apuntá la cámara al QR del cliente';
+      instruccion.textContent='Apuntá la cámara al código QR del cliente';
       document.getElementById('cantidad').value=1;
       scanner.start({facingMode:'environment'},{fps:10,qrbox:{width:250,height:250}},async(texto)=>{
         if(!escaneando)return;escaneando=false;scanner.stop();
@@ -263,7 +482,7 @@ app.get('/escanear', requireAuth, (req, res) => {
           if(res.ok){
             clienteId=texto;
             document.getElementById('cliente-nombre').textContent=data.nombre;
-            document.getElementById('cliente-info').textContent='Progreso: '+data.progreso+'/10'+(data.disponibles>0?' · 🥟×'+data.disponibles+' disponibles':'');
+            document.getElementById('cliente-info').textContent='Progreso actual: '+data.progreso+'/10'+(data.disponibles>0?' · 🥟×'+data.disponibles+' empanada(s) gratis':'');
             instruccion.textContent='';confirmar.style.display='block';
           }else{resultado.style.display='block';resultado.className='error';resultado.textContent='✗ Cliente no encontrado';setTimeout(iniciarScanner,2500);}
         }catch(e){resultado.style.display='block';resultado.className='error';resultado.textContent='✗ Error de conexión';setTimeout(iniciarScanner,2500);}
@@ -272,14 +491,14 @@ app.get('/escanear', requireAuth, (req, res) => {
     document.getElementById('btn-cancelar').addEventListener('click',iniciarScanner);
     document.getElementById('btn-confirmar').addEventListener('click',async()=>{
       const cantidad=parseInt(document.getElementById('cantidad').value)||1;
-      confirmar.style.display='none';resultado.style.display='block';resultado.className='';resultado.textContent='Agregando sellos...';
+      confirmar.style.display='none';resultado.style.display='block';resultado.className='';resultado.textContent='Registrando sellos...';
       try{
         const res=await fetch('/api/sello/'+clienteId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cantidad})});
         const data=await res.json();
         if(res.ok){
-          if(data.disponibles>0){resultado.className='premio';resultado.textContent='🥟 ¡'+data.disponibles+' empanada'+(data.disponibles>1?'s':'')+' gratis disponible'+(data.disponibles>1?'s':'')+' para '+data.nombre+'!';}
+          if(data.disponibles>0){resultado.className='premio';resultado.innerHTML='🥟 ¡'+data.disponibles+' empanada'+(data.disponibles>1?'s':'')+' de regalo disponible'+(data.disponibles>1?'s':'')+' para '+data.nombre+'!';}
           else{resultado.className='ok';resultado.textContent='✓ '+cantidad+' sello(s) agregado(s) a '+data.nombre+' ('+data.progreso+'/10)';}
-          if(data.walletSync===false){resultado.className='warn';resultado.textContent+=' ⚠️ Los sellos se guardaron, pero la tarjeta de Wallet NO se actualizó. Avisá al cliente que puede tardar, o revisá los logs.';}
+          if(data.walletSync===false){resultado.className='warn';resultado.textContent+=' ⚠️ Los sellos se guardaron, pero la tarjeta de Wallet NO se actualizó. Revisá los registros del servidor.';}
         }else{resultado.className='error';resultado.textContent='✗ '+(data.error||'Error al agregar sellos');}
       }catch(e){resultado.className='error';resultado.textContent='✗ Error de conexión';}
       setTimeout(iniciarScanner,resultado.className==='warn'?8000:3500);
@@ -304,7 +523,7 @@ app.post('/api/sello/:id', requireAuth, async (req, res) => {
   const clienteActualizado = await obtenerCliente(id);
   const { progreso, disponibles } = calcularPremios(clienteActualizado);
   let walletSync = true;
-  try { await actualizarWallet(clienteActualizado); } catch (err) { walletSync = false; }
+  try { walletSync = await actualizarWallet(clienteActualizado); } catch (err) { walletSync = false; }
   res.json({ nombre: cliente.nombre, progreso, disponibles, walletSync });
 });
 
@@ -314,8 +533,8 @@ inicializarDB()
       console.log(`✅ Servidor corriendo en http://localhost:${process.env.PORT || 3000}`);
       console.log(`   Registro:  http://localhost:3000/registro`);
       console.log(`   Panel:     http://localhost:3000/panel`);
-      console.log(`   QR:        http://localhost:3000/qr`);
       if (!PANEL_PASSWORD) console.warn('⚠️  PANEL_PASSWORD no está configurada: el acceso al panel y al escáner queda bloqueado.');
+      console.log(`   QR:        http://localhost:3000/qr`);
     });
   })
   .catch(err => { console.error('❌ Error conectando a la base de datos:', err); process.exit(1); });
