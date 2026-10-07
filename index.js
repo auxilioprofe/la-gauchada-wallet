@@ -25,6 +25,9 @@ function requireAuth(req, res, next) {
 }
 
 const ISSUER_ID = process.env.ISSUER_ID;
+// Normalizado: un espacio o un salto de línea de más en el panel de Render
+// rompía la comparación exacta del login sin ninguna pista de por qué.
+const PANEL_PASSWORD = (process.env.PANEL_PASSWORD || '').trim();
 const CLASS_ID = process.env.CLASS_ID;
 
 // ── Base de datos Turso ────────────────────────────────────
@@ -153,11 +156,14 @@ async function actualizarWallet(cliente) {
 // ── RUTAS ──────────────────────────────────────────────────
 
 app.get('/login', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Acceso Panel</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:32px 24px;max-width:360px;width:100%;text-align:center}.logo{font-size:24px;font-weight:800;color:#00ADEF;margin-bottom:4px}.subtitle{color:#666;font-size:14px;margin-bottom:28px}input{width:100%;padding:14px 16px;border:2px solid #e0e0e0;border-radius:12px;font-size:16px;margin-bottom:12px;outline:none}input:focus{border-color:#00ADEF}button{width:100%;padding:16px;background:#00ADEF;color:white;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer}.error{color:#e53e3e;font-size:14px;margin-bottom:12px}</style></head><body><div class="card"><div class="logo">LA GAUCHADA</div><div class="subtitle">Acceso al panel</div>${req.query.error ? '<div class="error">Contraseña incorrecta</div>' : ''}<form action="/login" method="POST"><input type="password" name="password" placeholder="Contraseña" required autofocus><button type="submit">Entrar →</button></form></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Acceso Panel</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#00ADEF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}.card{background:white;border-radius:20px;padding:32px 24px;max-width:360px;width:100%;text-align:center}.logo{font-size:24px;font-weight:800;color:#00ADEF;margin-bottom:4px}.subtitle{color:#666;font-size:14px;margin-bottom:28px}input{width:100%;padding:14px 16px;border:2px solid #e0e0e0;border-radius:12px;font-size:16px;margin-bottom:12px;outline:none}input:focus{border-color:#00ADEF}button{width:100%;padding:16px;background:#00ADEF;color:white;border:none;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer}.error{color:#e53e3e;font-size:14px;margin-bottom:12px}</style></head><body><div class="card"><div class="logo">LA GAUCHADA</div><div class="subtitle">Acceso al panel</div>${req.query.error === '2' ? '<div class="error">El servidor no tiene PANEL_PASSWORD configurada. Cargala en las variables de entorno y reintentá.</div>' : req.query.error ? '<div class="error">Contraseña incorrecta</div>' : ''}<form action="/login" method="POST"><input type="password" name="password" placeholder="Contraseña" required autofocus><button type="submit">Entrar →</button></form></div></body></html>`);
 });
 
 app.post('/login', (req, res) => {
-  if (req.body.password === process.env.PANEL_PASSWORD) { req.session.autenticado = true; res.redirect('/panel'); }
+  // Sin contraseña configurada el panel queda cerrado, nunca abierto.
+  if (!PANEL_PASSWORD) return res.redirect('/login?error=2');
+  const ingresada = (req.body.password || '').trim();
+  if (ingresada && ingresada === PANEL_PASSWORD) { req.session.autenticado = true; res.redirect('/panel'); }
   else res.redirect('/login?error=1');
 });
 
@@ -309,6 +315,7 @@ inicializarDB()
       console.log(`   Registro:  http://localhost:3000/registro`);
       console.log(`   Panel:     http://localhost:3000/panel`);
       console.log(`   QR:        http://localhost:3000/qr`);
+      if (!PANEL_PASSWORD) console.warn('⚠️  PANEL_PASSWORD no está configurada: el acceso al panel y al escáner queda bloqueado.');
     });
   })
   .catch(err => { console.error('❌ Error conectando a la base de datos:', err); process.exit(1); });
